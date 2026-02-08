@@ -231,3 +231,24 @@ func extractErrorTail(v string, lines int, limit int) string {
 	}
 	return out
 }
+
+func classifyStructuredParseFailure(err error, output string) (code, userMsg string) {
+	raw := strings.TrimSpace(output)
+	if raw == "" {
+		return "salida_vacia", "salida vacia"
+	}
+	if err == nil {
+		return "formato_desconocido", "formato no reconocido"
+	}
+	e := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(e, "missing ") || strings.Contains(e, "required"):
+		return "campos_requeridos_faltantes", "faltan campos requeridos"
+	case strings.Contains(e, "unsupported schema") || strings.Contains(e, "schema"):
+		return "schema_no_cumplido", "no cumple schema"
+	case strings.Contains(e, "invalid") || strings.Contains(e, "cannot") || strings.Contains(e, "json"):
+		return "json_invalido", "json invalido"
+	default:
+		return "formato_desconocido", "formato no reconocido"
+	}
+}

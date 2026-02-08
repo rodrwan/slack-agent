@@ -17,8 +17,11 @@ import (
 )
 
 type JobController interface {
-	CreateAndQueueJob(ctx context.Context, repo, baseBranch, prompt, channelID, userID string) (model.Job, error)
+	CreateAndQueueJob(ctx context.Context, repo, baseBranch, prompt, channelID, threadTS, userID string) (model.Job, error)
 	HandleThreadInput(jobID, text string) error
+	HandleChatMessage(channelID, threadTS, userID, text string) (string, []map[string]any, bool, error)
+	ApplyChatSession(sessionKey string) error
+	CancelChatSession(sessionKey string) error
 	AllowOnce(jobID string) error
 	Abort(jobID string) error
 	RunTests(jobID string) error
@@ -95,7 +98,7 @@ func (s *Server) handleSlashCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	channelID := r.Form.Get("channel_id")
 	userID := r.Form.Get("user_id")
-	if _, err := s.jobs.CreateAndQueueJob(r.Context(), repo, branch, prompt, channelID, userID); err != nil {
+	if _, err := s.jobs.CreateAndQueueJob(r.Context(), repo, branch, prompt, channelID, "", userID); err != nil {
 		http.Error(w, "failed creating job", http.StatusInternalServerError)
 		return
 	}
@@ -136,6 +139,10 @@ func (s *Server) handleInteractions(w http.ResponseWriter, r *http.Request) {
 	a := p.Actions[0]
 	var err error
 	switch a.ActionID {
+	case "chat_apply":
+		err = s.jobs.ApplyChatSession(a.Value)
+	case "chat_cancel":
+		err = s.jobs.CancelChatSession(a.Value)
 	case "allow_once":
 		err = s.jobs.AllowOnce(a.Value)
 	case "deny", "abort":
@@ -158,6 +165,8 @@ type eventEnvelope struct {
 	Type      string `json:"type"`
 	Challenge string `json:"challenge"`
 	Event     struct {
+		Channel  string `json:"channel"`
+		User     string `json:"user"`
 		Type     string `json:"type"`
 		Text     string `json:"text"`
 		ThreadTS string `json:"thread_ts"`
@@ -188,11 +197,23 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if env.Event.Type == "message" && env.Event.Subtype == "" && env.Event.BotID == "" && env.Event.ThreadTS != "" {
+		text := strings.TrimSpace(env.Event.Text)
 		if strings.HasPrefix(strings.TrimSpace(env.Event.Text), "job_") {
-			parts := strings.SplitN(strings.TrimSpace(env.Event.Text), " ", 2)
+			parts := strings.SplitN(text, " ", 2)
 			if len(parts) == 2 {
 				_ = s.jobs.HandleThreadInput(parts[0], parts[1])
 			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		summary, actions, handled, err := s.jobs.HandleChatMessage(env.Event.Channel, env.Event.ThreadTS, env.Event.User, text)
+		if err != nil {
+			http.Error(w, "chat handling failed", http.StatusInternalServerError)
+			return
+		}
+		if handled {
+			blocks := s.client.FormatStatusBlocks("chat", summary, actions)
+			_, _ = s.client.PostMessage(r.Context(), env.Event.Channel, env.Event.ThreadTS, summary, blocks)
 		}
 	}
 	w.WriteHeader(http.StatusOK)

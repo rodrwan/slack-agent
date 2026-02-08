@@ -147,6 +147,26 @@ For thread input on `needs_input`, post:
 job_<id> your additional instruction
 ```
 
+## Conversational Mode (Thread)
+
+You can now talk to the bot directly in a Slack thread without `job_<id> ...` for planning/apply:
+
+1. In a thread, send a message including repo + objective:
+
+```text
+repo=my-org/my-repo branch=main fix login race condition and add regression tests
+```
+
+2. Bot replies with a proposal and buttons:
+- `Aplicar cambios`
+- `Cancelar`
+
+3. If you want to refine scope, just reply in the same thread in natural language.
+
+4. When ready, click `Aplicar cambios` to create and run the job in that same thread.
+
+Note: the legacy `job_<id> ...` format is still supported for explicit `needs_input` resumes.
+
 ## Safety Behavior
 
 Policy gate blocks obvious dangerous patterns and flags unknown commands for approval.

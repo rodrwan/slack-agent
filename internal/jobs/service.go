@@ -66,6 +66,19 @@ type Service struct {
 
 	queue    chan string
 	repoLock sync.Map
+
+	chatSessions sync.Map
+}
+
+type chatSession struct {
+	Key        string
+	ChannelID  string
+	ThreadTS   string
+	UserID     string
+	Repo       string
+	BaseBranch string
+	Prompt     string
+	Mode       string
 }
 
 var rateLimitRetryRe = regexp.MustCompile(`Please try again in ([0-9]+(?:\.[0-9]+)?)s`)
@@ -116,7 +129,7 @@ func (s *Service) RecoverPendingJobs() {
 	}
 }
 
-func (s *Service) CreateAndQueueJob(_ context.Context, repo, baseBranch, prompt, channelID, userID string) (model.Job, error) {
+func (s *Service) CreateAndQueueJob(_ context.Context, repo, baseBranch, prompt, channelID, threadTS, userID string) (model.Job, error) {
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
 	j := model.Job{
 		ID:             jobID,
@@ -127,6 +140,7 @@ func (s *Service) CreateAndQueueJob(_ context.Context, repo, baseBranch, prompt,
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 		SlackChannelID: channelID,
+		SlackThreadTS:  strings.TrimSpace(threadTS),
 		SlackUserID:    userID,
 	}
 	if err := s.store.CreateJob(j); err != nil {
@@ -151,6 +165,73 @@ func (s *Service) CreateAndQueueJob(_ context.Context, repo, baseBranch, prompt,
 	}
 	s.Enqueue(jobID)
 	return j, nil
+}
+
+func (s *Service) HandleChatMessage(channelID, threadTS, userID, text string) (string, []map[string]any, bool, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", nil, false, nil
+	}
+	key := chatSessionKey(channelID, threadTS)
+	raw, ok := s.chatSessions.Load(key)
+	if !ok {
+		repo, branch, prompt := parseConversationSeed(text)
+		if repo == "" {
+			return "Para empezar necesito repo y objetivo en este mismo thread. Ejemplo:\n`repo=org/repo branch=main corrige bug de login y agrega tests`", nil, true, nil
+		}
+		if prompt == "" {
+			return "Entendí el repo, pero me falta el objetivo. Escribe qué problema quieres resolver y te propongo un plan antes de ejecutar.", nil, true, nil
+		}
+		cs := chatSession{
+			Key:        key,
+			ChannelID:  channelID,
+			ThreadTS:   threadTS,
+			UserID:     userID,
+			Repo:       repo,
+			BaseBranch: branch,
+			Prompt:     prompt,
+			Mode:       "ready_to_apply",
+		}
+		s.chatSessions.Store(key, cs)
+		_ = s.store.AddEvent("chat:"+key, "chat_context_updated", trimForStore(fmt.Sprintf("repo=%s branch=%s", repo, branch), 800))
+		return buildChatProposalSummary(cs), buildChatProposalActions(key), true, nil
+	}
+	cs := raw.(chatSession)
+	if cs.Mode == "executing" {
+		return "Ya estoy ejecutando cambios para esta conversación. Espera el siguiente estado del job o ajusta cuando termine.", nil, true, nil
+	}
+	cs.Prompt = strings.TrimSpace(cs.Prompt + "\n" + text)
+	cs.Mode = "ready_to_apply"
+	s.chatSessions.Store(key, cs)
+	_ = s.store.AddEvent("chat:"+key, "chat_context_updated", trimForStore("prompt_refined", 800))
+	return buildChatProposalSummary(cs), buildChatProposalActions(key), true, nil
+}
+
+func (s *Service) ApplyChatSession(sessionKey string) error {
+	raw, ok := s.chatSessions.Load(sessionKey)
+	if !ok {
+		return fmt.Errorf("chat session not found")
+	}
+	cs := raw.(chatSession)
+	if cs.Mode == "executing" {
+		return nil
+	}
+	cs.Mode = "executing"
+	s.chatSessions.Store(sessionKey, cs)
+	_, err := s.CreateAndQueueJob(context.Background(), cs.Repo, cs.BaseBranch, cs.Prompt, cs.ChannelID, cs.ThreadTS, cs.UserID)
+	if err != nil {
+		cs.Mode = "ready_to_apply"
+		s.chatSessions.Store(sessionKey, cs)
+		return err
+	}
+	_ = s.store.AddEvent("chat:"+sessionKey, "chat_apply_confirmed", "apply requested")
+	return nil
+}
+
+func (s *Service) CancelChatSession(sessionKey string) error {
+	s.chatSessions.Delete(sessionKey)
+	_ = s.store.AddEvent("chat:"+sessionKey, "chat_cancelled", "cancelled by user")
+	return nil
 }
 
 func (s *Service) Enqueue(jobID string) {
@@ -249,10 +330,12 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	if s.outputMode == OutputModeStructured {
 		parsed, err = parseStructuredOutput(res.CombinedOutput)
 		if err != nil {
-			s.store.AddEvent(j.ID, "output_parse_failed", trimForStore(err.Error(), 1000))
+			causeCode, causeMsg := classifyStructuredParseFailure(err, res.CombinedOutput)
+			s.addStructuredParseEvent(j.ID, "output_parse_failed", causeCode, 0, err.Error())
 			if s.slackLogMode != LogModeStream {
-				_ = s.notifier.PostJobLog(ctx, j, "La salida no cumplió el formato esperado; reintentando en modo estructurado.")
+				_ = s.notifier.PostJobLog(ctx, j, "No se pudo validar salida estructurada ("+causeMsg+"). Reintentando automáticamente (intento 1/1).")
 			}
+			s.addStructuredParseEvent(j.ID, "output_parse_retry_started", causeCode, 1, "retry requested")
 			retryPrompt := buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, true)
 			retryRes, retryErr, retryPolicyErr := s.runCodexWithRateLimitRetry(ctx, j, retryPrompt, codexEnv)
 			if retryPolicyErr != nil {
@@ -283,9 +366,11 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			}
 			parsed, err = parseStructuredOutput(retryRes.CombinedOutput)
 			if err != nil {
-				s.store.AddEvent(j.ID, "output_parse_failed_final", trimForStore(err.Error(), 1000))
+				finalCode, finalMsg := classifyStructuredParseFailure(err, retryRes.CombinedOutput)
+				s.addStructuredParseEvent(j.ID, "output_parse_failed_final", finalCode, 1, err.Error())
+				s.addStructuredParseEvent(j.ID, "output_degraded_continue", finalCode, 1, "continue with internal summary and diff")
 				if s.slackLogMode != LogModeStream {
-					_ = s.notifier.PostJobLog(ctx, j, "No se pudo estructurar la salida tras el reintento. Se continúa con resumen interno y diff para revisión.")
+					_ = s.notifier.PostJobLog(ctx, j, "No se pudo obtener formato estructurado tras el reintento ("+finalMsg+"). Se continúa en modo degradado: resumen interno + diff para revisión.")
 				}
 			}
 		}
@@ -519,6 +604,21 @@ func (s *Service) addRuntimeSnapshotEvent(jobID string) {
 	}
 }
 
+func (s *Service) addStructuredParseEvent(jobID, eventType, cause string, attempt int, detail string) {
+	payload := map[string]any{
+		"cause":          strings.TrimSpace(cause),
+		"attempt":        attempt,
+		"mode":           s.outputMode,
+		"schema_version": s.schemaVer,
+		"detail":         trimForStore(strings.TrimSpace(detail), 600),
+	}
+	if b, err := json.Marshal(payload); err == nil {
+		_ = s.store.AddEvent(jobID, eventType, trimForStore(string(b), 1000))
+		return
+	}
+	_ = s.store.AddEvent(jobID, eventType, trimForStore(detail, 1000))
+}
+
 func (s *Service) ensureOutputSchemaFile(workspacePath string) (string, error) {
 	schema, err := outputSchemaForVersion(s.schemaVer)
 	if err != nil {
@@ -652,4 +752,45 @@ func (s *Service) ApproveAndCreatePR(jobID string) error {
 	}
 	s.store.AddEvent(j.ID, "pr_created", prURL)
 	return s.notifier.PostJobStatus(context.Background(), j, "PR creado: "+prURL, nil)
+}
+
+func chatSessionKey(channelID, threadTS string) string {
+	return strings.TrimSpace(channelID) + "|" + strings.TrimSpace(threadTS)
+}
+
+func parseConversationSeed(text string) (repo, branch, prompt string) {
+	branch = "main"
+	for _, token := range strings.Fields(text) {
+		switch {
+		case strings.HasPrefix(token, "repo="):
+			repo = strings.TrimSpace(strings.TrimPrefix(token, "repo="))
+		case strings.HasPrefix(token, "branch="):
+			branch = strings.TrimSpace(strings.TrimPrefix(token, "branch="))
+		}
+	}
+	normalized := text
+	if repo != "" {
+		normalized = strings.ReplaceAll(normalized, "repo="+repo, "")
+	}
+	if branch != "" {
+		normalized = strings.ReplaceAll(normalized, "branch="+branch, "")
+	}
+	prompt = strings.TrimSpace(normalized)
+	prompt = strings.Trim(prompt, "\"")
+	return repo, branch, prompt
+}
+
+func buildChatProposalSummary(cs chatSession) string {
+	return "Entendí tu objetivo y ya tengo un plan para ejecutar.\n" +
+		"*Repo:* `" + cs.Repo + "`\n" +
+		"*Base branch:* `" + cs.BaseBranch + "`\n" +
+		"*Objetivo:* " + trimForStore(cs.Prompt, 600) + "\n\n" +
+		"Si estás de acuerdo, pulsa *Aplicar cambios*. Si quieres ajustar alcance, responde en este thread y refino la propuesta."
+}
+
+func buildChatProposalActions(sessionKey string) []map[string]any {
+	return []map[string]any{
+		{"type": "button", "action_id": "chat_apply", "text": map[string]any{"type": "plain_text", "text": "Aplicar cambios"}, "value": sessionKey, "style": "primary"},
+		{"type": "button", "action_id": "chat_cancel", "text": map[string]any{"type": "plain_text", "text": "Cancelar"}, "value": sessionKey, "style": "danger"},
+	}
 }
