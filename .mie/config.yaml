@@ -1,0 +1,11 @@
+version: "1"
+storage:
+    engine: rocksdb
+    path: "/Users/roddotcom/Codes/go/src/github.com/rodrwan/slack-codex/.mie/data"
+embedding:
+    enabled: true
+    provider: ollama
+    base_url: http://localhost:11434
+    model: nomic-embed-text
+    dimensions: 768
+    workers: 4

@@ -1,0 +1,24 @@
+version: "1"
+project_id: slack-codex
+cie:
+    primary_hub: ""
+    edge_cache: ""
+embedding:
+    provider: ollama
+    base_url: http://localhost:11434
+    model: nomic-embed-text
+    dimensions: 768
+indexing:
+    parser_mode: auto
+    batch_target: 500
+    max_file_size: 1048576
+    exclude:
+        - .git/**
+        - node_modules/**
+        - vendor/**
+        - dist/**
+        - build/**
+        - '*.o'
+        - '*.so'
+        - '*.dylib'
+        - '*.exe'
