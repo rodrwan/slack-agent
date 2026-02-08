@@ -35,7 +35,7 @@ func Load() Config {
 		DataDir:              dataDir,
 		DatabasePath:         dbPath,
 		WorkspaceRoot:        workspaceRoot,
-		CodexCommand:         envOrDefault("CODEX_COMMAND", "codex"),
+		CodexCommand:         envOrDefault("CODEX_COMMAND", "codex exec"),
 		CodexTimeout:         durationOrDefault("CODEX_TIMEOUT", 30*time.Minute),
 		RunnerInactivity:     durationOrDefault("RUNNER_INACTIVITY_TIMEOUT", 45*time.Second),
 		MaxConcurrentJobs:    intOrDefault("MAX_CONCURRENT_JOBS", 2),

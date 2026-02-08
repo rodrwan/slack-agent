@@ -21,7 +21,7 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 
 - Go 1.25.4+
 - `git` binary available
-- Codex CLI installed and reachable as `CODEX_COMMAND` (default: `codex`)
+- Codex CLI installed and reachable as `CODEX_COMMAND` (default: `codex exec`)
 - Slack app with bot token + signing secret
 - GitHub token (or GitHub App installation token) with repo write + PR permissions
 
@@ -61,7 +61,7 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 | `WORKSPACE_ROOT` | no | `/data/workspaces` | Per-job clone/workspace root |
 | `SLACK_BOT_TOKEN` | yes | - | Slack bot token |
 | `SLACK_SIGNING_SECRET` | no | empty | Slack request signature validation |
-| `CODEX_COMMAND` | no | `codex` | Command used to run Codex |
+| `CODEX_COMMAND` | no | `codex exec` | Command used to run Codex in non-interactive mode |
 | `OPENAI_API_KEY` | yes | - | API key used by Codex CLI |
 | `CODEX_TIMEOUT` | no | `30m` | Max Codex run time |
 | `RUNNER_INACTIVITY_TIMEOUT` | no | `45s` | Idle timeout before `needs_input` |
@@ -96,7 +96,7 @@ docker run --rm -p 8080:8080 \
   -e SLACK_SIGNING_SECRET \
   -e GITHUB_TOKEN \
   -e OPENAI_API_KEY \
-  -e CODEX_COMMAND=codex \
+  -e CODEX_COMMAND="codex exec" \
   -v $(pwd)/.data:/data \
   slack-codex-runner
 ```
