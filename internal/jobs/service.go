@@ -525,6 +525,9 @@ func (s *Service) ensureOutputSchemaFile(workspacePath string) (string, error) {
 		return "", err
 	}
 	path := s.outputSchemaPath(workspacePath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
 	if err := os.WriteFile(path, schema, 0o644); err != nil {
 		return "", err
 	}
@@ -537,7 +540,11 @@ func (s *Service) outputSchemaPath(workspacePath string) string {
 		version = "v1"
 	}
 	filename := ".codex-output-schema-" + version + ".json"
-	return filepath.Join(workspacePath, filename)
+	base := workspacePath
+	if abs, err := filepath.Abs(workspacePath); err == nil {
+		base = abs
+	}
+	return filepath.Join(base, filename)
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {
