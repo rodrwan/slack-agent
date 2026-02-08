@@ -1,7 +1,7 @@
 FROM golang:1.25.4-alpine AS build
 RUN apk add --no-cache git
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY cmd ./cmd
 COPY internal ./internal
 RUN go build -o /out/slack-codex-runner ./cmd/bot
