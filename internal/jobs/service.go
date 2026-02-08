@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +64,8 @@ type Service struct {
 	queue    chan string
 	repoLock sync.Map
 }
+
+var rateLimitRetryRe = regexp.MustCompile(`Please try again in ([0-9]+(?:\.[0-9]+)?)s`)
 
 func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
 	if workers < 1 {
@@ -205,7 +209,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		promptText = buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, false)
 	}
 
-	res, runErr, policyErr := s.runCodexOnce(ctx, j, promptText, codexEnv)
+	res, runErr, policyErr := s.runCodexWithRateLimitRetry(ctx, j, promptText, codexEnv)
 	if policyErr != nil {
 		return policyErr
 	}
@@ -241,7 +245,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 				_ = s.notifier.PostJobLog(ctx, j, "La salida no cumplió el formato esperado; reintentando en modo estructurado.")
 			}
 			retryPrompt := buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, true)
-			retryRes, retryErr, retryPolicyErr := s.runCodexOnce(ctx, j, retryPrompt, codexEnv)
+			retryRes, retryErr, retryPolicyErr := s.runCodexWithRateLimitRetry(ctx, j, retryPrompt, codexEnv)
 			if retryPolicyErr != nil {
 				return retryPolicyErr
 			}
@@ -385,6 +389,51 @@ func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, 
 		ExecutionTimeout:  s.execTimeout,
 	}, onLine)
 	return res, runErr, nil
+}
+
+func (s *Service) runCodexWithRateLimitRetry(ctx context.Context, j model.Job, prompt string, codexEnv []string) (runner.Result, error, error) {
+	res, runErr, policyErr := s.runCodexOnce(ctx, j, prompt, codexEnv)
+	if policyErr != nil {
+		return res, runErr, policyErr
+	}
+	if runErr == nil && res.ExitErr == nil {
+		return res, runErr, nil
+	}
+	wait, ok := detectRateLimitRetryAfter(res.CombinedOutput)
+	if !ok {
+		return res, runErr, nil
+	}
+	if wait > 30*time.Second {
+		wait = 30 * time.Second
+	}
+	if wait < 2*time.Second {
+		wait = 2 * time.Second
+	}
+	s.store.AddEvent(j.ID, "rate_limit_retry", wait.String())
+	if s.slackLogMode != LogModeStream {
+		_ = s.notifier.PostJobLog(ctx, j, fmt.Sprintf("Rate limit de OpenAI detectado. Reintentando automáticamente en %s.", wait.Round(time.Second)))
+	}
+	select {
+	case <-time.After(wait):
+	case <-ctx.Done():
+		return res, runErr, nil
+	}
+	return s.runCodexOnce(ctx, j, prompt, codexEnv)
+}
+
+func detectRateLimitRetryAfter(output string) (time.Duration, bool) {
+	if !strings.Contains(output, "Rate limit reached") {
+		return 0, false
+	}
+	m := rateLimitRetryRe.FindStringSubmatch(output)
+	if len(m) != 2 {
+		return 5 * time.Second, true
+	}
+	secs, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || secs <= 0 {
+		return 5 * time.Second, true
+	}
+	return time.Duration(secs * float64(time.Second)), true
 }
 
 func (s *Service) postFailureContext(j model.Job, output string) {
