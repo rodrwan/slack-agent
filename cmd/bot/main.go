@@ -40,7 +40,6 @@ func main() {
 		gh.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken),
 		cfg.CodexCommand,
 		cfg.CodexSandboxMode,
-		cfg.CodexApprovalPolicy,
 		cfg.CodexModel,
 		cfg.AgentOutputMode,
 		cfg.AgentOutputSchemaVer,

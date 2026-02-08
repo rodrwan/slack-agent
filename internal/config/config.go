@@ -16,7 +16,6 @@ type Config struct {
 	WorkspaceRoot        string
 	CodexCommand         string
 	CodexSandboxMode     string
-	CodexApprovalPolicy  string
 	CodexModel           string
 	AgentOutputMode      string
 	AgentOutputSchemaVer string
@@ -43,7 +42,6 @@ func Load() Config {
 		WorkspaceRoot:        workspaceRoot,
 		CodexCommand:         envOrDefault("CODEX_COMMAND", "codex exec"),
 		CodexSandboxMode:     envOrDefault("CODEX_SANDBOX_MODE", "workspace-write"),
-		CodexApprovalPolicy:  envOrDefault("CODEX_APPROVAL_POLICY", "never"),
 		CodexModel:           envOrDefault("CODEX_MODEL", "gpt-5.2-codex"),
 		AgentOutputMode:      envOrDefault("AGENT_OUTPUT_MODE", "structured"),
 		AgentOutputSchemaVer: envOrDefault("AGENT_OUTPUT_SCHEMA_VERSION", "v1"),

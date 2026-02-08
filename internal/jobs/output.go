@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,6 +28,9 @@ type structuredOutput struct {
 	FullReportMarkdown string   `json:"full_report_markdown"`
 }
 
+//go:embed schema/structured_output_v1.json
+var structuredOutputSchemaV1 []byte
+
 func normalizeOutputMode(v string) string {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case OutputModeRaw:
@@ -47,14 +51,11 @@ func normalizeLogMode(v string) string {
 
 func buildCodexPrompt(userPrompt, lastInput, schemaVersion string, retry bool) string {
 	var b strings.Builder
-	b.WriteString("Responde solo con JSON valido UTF-8, sin markdown y sin texto fuera del JSON.\n")
-	b.WriteString("Schema version: ")
+	b.WriteString("Contexto de salida estructurada: schema ")
 	b.WriteString(strings.TrimSpace(schemaVersion))
 	b.WriteString(".\n")
-	b.WriteString("Campos requeridos: version, task_summary, key_findings, artifacts, risks, next_steps, full_report_markdown.\n")
-	b.WriteString("Reglas: task_summary corto; key_findings/risk/next_steps como arreglos de strings; artifacts como arreglo de {path, description}.\n")
 	if retry {
-		b.WriteString("Intento de correccion: la salida anterior no cumplio el contrato. Devuelve JSON estricto.\n")
+		b.WriteString("Intento de correccion: la salida anterior no fue parseable. Devuelve una respuesta final coherente y completa.\n")
 	}
 	b.WriteString("Objetivo:\n")
 	b.WriteString(strings.TrimSpace(userPrompt))
@@ -63,6 +64,15 @@ func buildCodexPrompt(userPrompt, lastInput, schemaVersion string, retry bool) s
 		b.WriteString(strings.TrimSpace(lastInput))
 	}
 	return b.String()
+}
+
+func outputSchemaForVersion(version string) ([]byte, error) {
+	switch strings.TrimSpace(version) {
+	case "", "v1":
+		return structuredOutputSchemaV1, nil
+	default:
+		return nil, fmt.Errorf("unsupported schema version: %s", version)
+	}
 }
 
 func parseStructuredOutput(raw string) (structuredOutput, error) {

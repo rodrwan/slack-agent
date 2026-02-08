@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -56,7 +57,6 @@ type Service struct {
 	github       GitHubClient
 	codexCmd     string
 	codexSandbox string
-	codexAsk     string
 	codexModel   string
 	outputMode   string
 	schemaVer    string
@@ -70,7 +70,7 @@ type Service struct {
 
 var rateLimitRetryRe = regexp.MustCompile(`Please try again in ([0-9]+(?:\.[0-9]+)?)s`)
 
-func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, codexSandbox, codexAsk, codexModel, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
+func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, codexSandbox, codexModel, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
 	if workers < 1 {
 		workers = 1
 	}
@@ -83,7 +83,6 @@ func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *po
 		github:       gh,
 		codexCmd:     strings.TrimSpace(codexCmd),
 		codexSandbox: strings.TrimSpace(codexSandbox),
-		codexAsk:     strings.TrimSpace(codexAsk),
 		codexModel:   strings.TrimSpace(codexModel),
 		outputMode:   normalizeOutputMode(outputMode),
 		schemaVer:    strings.TrimSpace(schemaVer),
@@ -360,7 +359,15 @@ func buildCodexEnv() []string {
 }
 
 func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, codexEnv []string) (runner.Result, error, error) {
-	command := s.buildCodexCommand(prompt)
+	schemaPath := ""
+	if s.outputMode == OutputModeStructured && isCodexCommand(s.codexCmd) {
+		p, err := s.ensureOutputSchemaFile(j.WorkspacePath)
+		if err != nil {
+			return runner.Result{}, nil, s.failJob(ctx, j, fmt.Errorf("prepare output schema: %w", err))
+		}
+		schemaPath = p
+	}
+	command := s.buildCodexCommand(prompt, schemaPath)
 	pd := s.policy.Evaluate(command)
 	switch pd.Decision {
 	case policy.Deny:
@@ -463,17 +470,17 @@ func buildNeedsInputStatus(jobID, output string) string {
 	return msg
 }
 
-func (s *Service) buildCodexCommand(prompt string) string {
+func (s *Service) buildCodexCommand(prompt, schemaPath string) string {
 	cmd := s.codexCmd
 	if isCodexCommand(cmd) {
 		if s.codexSandbox != "" && !strings.Contains(cmd, "--sandbox") {
 			cmd += " --sandbox " + shellQuote(s.codexSandbox)
 		}
-		if s.codexAsk != "" && !strings.Contains(cmd, "--ask-for-approval") {
-			cmd += " --ask-for-approval " + shellQuote(s.codexAsk)
-		}
 		if s.codexModel != "" && !strings.Contains(cmd, "--model") {
 			cmd += " --model " + shellQuote(s.codexModel)
+		}
+		if schemaPath != "" && !strings.Contains(cmd, "--output-schema") {
+			cmd += " --output-schema " + shellQuote(schemaPath)
 		}
 	}
 	return strings.TrimSpace(cmd + " " + shellQuote(prompt))
@@ -502,12 +509,35 @@ func (s *Service) addRuntimeSnapshotEvent(jobID string) {
 	}
 	if isCodexCommand(s.codexCmd) {
 		payload["sandbox"] = s.codexSandbox
-		payload["approval"] = s.codexAsk
 		payload["model"] = s.codexModel
+	}
+	if s.outputMode == OutputModeStructured {
+		payload["schema_path"] = s.outputSchemaPath("(workspace)")
 	}
 	if b, err := json.Marshal(payload); err == nil {
 		_ = s.store.AddEvent(jobID, "runtime_snapshot", trimForStore(string(b), 1000))
 	}
+}
+
+func (s *Service) ensureOutputSchemaFile(workspacePath string) (string, error) {
+	schema, err := outputSchemaForVersion(s.schemaVer)
+	if err != nil {
+		return "", err
+	}
+	path := s.outputSchemaPath(workspacePath)
+	if err := os.WriteFile(path, schema, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (s *Service) outputSchemaPath(workspacePath string) string {
+	version := strings.TrimSpace(s.schemaVer)
+	if version == "" {
+		version = "v1"
+	}
+	filename := ".codex-output-schema-" + version + ".json"
+	return filepath.Join(workspacePath, filename)
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {
