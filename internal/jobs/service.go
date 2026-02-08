@@ -55,6 +55,9 @@ type Service struct {
 	git          GitManager
 	github       GitHubClient
 	codexCmd     string
+	codexSandbox string
+	codexAsk     string
+	codexModel   string
 	outputMode   string
 	schemaVer    string
 	slackLogMode string
@@ -67,7 +70,7 @@ type Service struct {
 
 var rateLimitRetryRe = regexp.MustCompile(`Please try again in ([0-9]+(?:\.[0-9]+)?)s`)
 
-func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
+func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, codexSandbox, codexAsk, codexModel, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
 	if workers < 1 {
 		workers = 1
 	}
@@ -78,7 +81,10 @@ func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *po
 		policy:       pol,
 		git:          gm,
 		github:       gh,
-		codexCmd:     codexCmd,
+		codexCmd:     strings.TrimSpace(codexCmd),
+		codexSandbox: strings.TrimSpace(codexSandbox),
+		codexAsk:     strings.TrimSpace(codexAsk),
+		codexModel:   strings.TrimSpace(codexModel),
 		outputMode:   normalizeOutputMode(outputMode),
 		schemaVer:    strings.TrimSpace(schemaVer),
 		slackLogMode: normalizeLogMode(slackLogMode),
@@ -88,6 +94,9 @@ func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *po
 	}
 	if s.schemaVer == "" {
 		s.schemaVer = "v1"
+	}
+	if s.codexCmd == "" {
+		s.codexCmd = "codex exec"
 	}
 	for i := 0; i < workers; i++ {
 		go s.worker()
@@ -196,13 +205,14 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	}
 
 	codexEnv := buildCodexEnv()
-	if strings.Contains(strings.ToLower(s.codexCmd), "codex") && s.slackLogMode == LogModeStream {
+	if isCodexCommand(s.codexCmd) && s.slackLogMode == LogModeStream {
 		diag := "OPENAI_API_KEY missing"
 		if len(codexEnv) > 0 {
 			diag = fmt.Sprintf("OPENAI_API_KEY present (len=%d)", len(strings.TrimPrefix(codexEnv[0], "OPENAI_API_KEY=")))
 		}
 		_ = s.notifier.PostJobLog(context.Background(), j, "[diag] "+diag)
 	}
+	s.addRuntimeSnapshotEvent(j.ID)
 
 	promptText := strings.TrimSpace(j.Prompt + "\n" + j.LastInput)
 	if s.outputMode == OutputModeStructured {
@@ -276,10 +286,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			if err != nil {
 				s.store.AddEvent(j.ID, "output_parse_failed_final", trimForStore(err.Error(), 1000))
 				if s.slackLogMode != LogModeStream {
-					fallback := sanitizeOutputForSlack(retryRes.CombinedOutput, 1800)
-					if fallback != "" {
-						_ = s.notifier.PostJobLog(ctx, j, "*Salida degradada*\n```"+escapeBackticksForSlack(fallback)+"```")
-					}
+					_ = s.notifier.PostJobLog(ctx, j, "No se pudo estructurar la salida tras el reintento. Se continúa con resumen interno y diff para revisión.")
 				}
 			}
 		}
@@ -292,10 +299,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			}
 			_ = s.notifier.PostJobLog(ctx, j, formatStructuredSummary(parsed))
 		} else {
-			preview := sanitizeOutputForSlack(res.CombinedOutput, 1600)
-			if preview != "" {
-				_ = s.notifier.PostJobLog(ctx, j, "*Salida de Codex*\n```"+escapeBackticksForSlack(preview)+"```")
-			}
+			_ = s.notifier.PostJobLog(ctx, j, "No hubo resumen estructurado disponible. Revisa diff y acciones de revisión para continuar.")
 		}
 	}
 
@@ -356,7 +360,7 @@ func buildCodexEnv() []string {
 }
 
 func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, codexEnv []string) (runner.Result, error, error) {
-	command := strings.TrimSpace(s.codexCmd + " " + shellQuote(prompt))
+	command := s.buildCodexCommand(prompt)
 	pd := s.policy.Evaluate(command)
 	switch pd.Decision {
 	case policy.Deny:
@@ -385,7 +389,7 @@ func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, 
 		WorkspacePath:     j.WorkspacePath,
 		Command:           command,
 		Env:               codexEnv,
-		InactivityTimeout: s.inactivity,
+		InactivityTimeout: s.codexInactivityTimeout(),
 		ExecutionTimeout:  s.execTimeout,
 	}, onLine)
 	return res, runErr, nil
@@ -457,6 +461,53 @@ func buildNeedsInputStatus(jobID, output string) string {
 		msg += "\n\nÚltimo contexto observado:\n```" + escapeBackticksForSlack(contextTail) + "```"
 	}
 	return msg
+}
+
+func (s *Service) buildCodexCommand(prompt string) string {
+	cmd := s.codexCmd
+	if isCodexCommand(cmd) {
+		if s.codexSandbox != "" && !strings.Contains(cmd, "--sandbox") {
+			cmd += " --sandbox " + shellQuote(s.codexSandbox)
+		}
+		if s.codexAsk != "" && !strings.Contains(cmd, "--ask-for-approval") {
+			cmd += " --ask-for-approval " + shellQuote(s.codexAsk)
+		}
+		if s.codexModel != "" && !strings.Contains(cmd, "--model") {
+			cmd += " --model " + shellQuote(s.codexModel)
+		}
+	}
+	return strings.TrimSpace(cmd + " " + shellQuote(prompt))
+}
+
+func isCodexCommand(cmd string) bool {
+	fields := strings.Fields(strings.TrimSpace(cmd))
+	if len(fields) == 0 {
+		return false
+	}
+	return fields[0] == "codex"
+}
+
+func (s *Service) codexInactivityTimeout() time.Duration {
+	if isCodexCommand(s.codexCmd) && s.inactivity < 2*time.Minute {
+		return 2 * time.Minute
+	}
+	return s.inactivity
+}
+
+func (s *Service) addRuntimeSnapshotEvent(jobID string) {
+	payload := map[string]string{
+		"output_mode":    s.outputMode,
+		"schema_version": s.schemaVer,
+		"log_mode":       s.slackLogMode,
+	}
+	if isCodexCommand(s.codexCmd) {
+		payload["sandbox"] = s.codexSandbox
+		payload["approval"] = s.codexAsk
+		payload["model"] = s.codexModel
+	}
+	if b, err := json.Marshal(payload); err == nil {
+		_ = s.store.AddEvent(jobID, "runtime_snapshot", trimForStore(string(b), 1000))
+	}
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {

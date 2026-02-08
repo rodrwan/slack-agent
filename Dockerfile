@@ -7,7 +7,7 @@ COPY internal ./internal
 RUN go build -o /out/slack-codex-runner ./cmd/bot
 
 FROM alpine:3.20
-RUN apk add --no-cache git ca-certificates nodejs npm \
+RUN apk add --no-cache git ca-certificates nodejs npm ripgrep jq bash \
     && npm install -g @openai/codex
 WORKDIR /app
 COPY --from=build /out/slack-codex-runner /usr/local/bin/slack-codex-runner

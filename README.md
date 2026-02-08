@@ -62,6 +62,9 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 | `SLACK_BOT_TOKEN` | yes | - | Slack bot token |
 | `SLACK_SIGNING_SECRET` | no | empty | Slack request signature validation |
 | `CODEX_COMMAND` | no | `codex exec` | Command used to run Codex in non-interactive mode |
+| `CODEX_SANDBOX_MODE` | no | `workspace-write` | Codex sandbox mode for job execution |
+| `CODEX_APPROVAL_POLICY` | no | `never` | Codex internal approval policy |
+| `CODEX_MODEL` | no | `gpt-5.2-codex` | Model used by Codex CLI |
 | `OPENAI_API_KEY` | yes | - | API key used by Codex CLI |
 | `AGENT_OUTPUT_MODE` | no | `structured` | `structured` enforces JSON contract; `raw` keeps plain output |
 | `AGENT_OUTPUT_SCHEMA_VERSION` | no | `v1` | Structured output schema version |
@@ -100,6 +103,9 @@ docker run --rm -p 8080:8080 \
   -e GITHUB_TOKEN \
   -e OPENAI_API_KEY \
   -e CODEX_COMMAND="codex exec" \
+  -e CODEX_SANDBOX_MODE=workspace-write \
+  -e CODEX_APPROVAL_POLICY=never \
+  -e CODEX_MODEL=gpt-5.2-codex \
   -e AGENT_OUTPUT_MODE=structured \
   -e AGENT_OUTPUT_SCHEMA_VERSION=v1 \
   -e SLACK_LOG_MODE=summary \
@@ -111,7 +117,7 @@ docker run --rm -p 8080:8080 \
 
 1. Create service from this repo.
 2. Add a persistent volume mounted at `/data`.
-3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`, `AGENT_OUTPUT_MODE`, `AGENT_OUTPUT_SCHEMA_VERSION`, `SLACK_LOG_MODE`).
+3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`, `CODEX_SANDBOX_MODE`, `CODEX_APPROVAL_POLICY`, `CODEX_MODEL`, `AGENT_OUTPUT_MODE`, `AGENT_OUTPUT_SCHEMA_VERSION`, `SLACK_LOG_MODE`).
 4. Expose port `8080` and use healthcheck `/healthz`.
 5. Configure Slack URLs with your Railway public URL.
 
@@ -135,6 +141,7 @@ During execution:
   - Codex receives a JSON contract prompt.
   - Bot retries once if output is not valid JSON.
   - Bot posts a readable Spanish summary in the thread.
+  - In `summary` mode, raw model trace output is hidden.
 
 For thread input on `needs_input`, post:
 
