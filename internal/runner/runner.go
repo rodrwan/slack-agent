@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ var ErrNeedsInput = errors.New("runner appears to be waiting for input")
 type Spec struct {
 	WorkspacePath     string
 	Command           string
+	Env               []string
 	InactivityTimeout time.Duration
 	ExecutionTimeout  time.Duration
 }
@@ -46,6 +48,9 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 
 	cmd := exec.CommandContext(timeoutCtx, "/bin/sh", "-lc", spec.Command)
 	cmd.Dir = spec.WorkspacePath
+	if len(spec.Env) > 0 {
+		cmd.Env = append(os.Environ(), spec.Env...)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return Result{}, fmt.Errorf("stdout pipe: %w", err)

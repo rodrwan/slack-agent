@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -181,6 +182,14 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	}
 
 	command := strings.TrimSpace(s.codexCmd + " " + shellQuote(j.Prompt+"\n"+j.LastInput))
+	codexEnv := buildCodexEnv()
+	if strings.Contains(strings.ToLower(s.codexCmd), "codex") {
+		diag := "OPENAI_API_KEY missing"
+		if len(codexEnv) > 0 {
+			diag = fmt.Sprintf("OPENAI_API_KEY present (len=%d)", len(strings.TrimPrefix(codexEnv[0], "OPENAI_API_KEY=")))
+		}
+		_ = s.notifier.PostJobLog(context.Background(), j, "[diag] "+diag)
+	}
 	pd := s.policy.Evaluate(command)
 	switch pd.Decision {
 	case policy.Deny:
@@ -201,6 +210,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	res, runErr := s.runner.Run(ctx, runner.Spec{
 		WorkspacePath:     j.WorkspacePath,
 		Command:           command,
+		Env:               codexEnv,
 		InactivityTimeout: s.inactivity,
 		ExecutionTimeout:  s.execTimeout,
 	}, func(line string) {
@@ -274,6 +284,14 @@ func trimForStore(v string, n int) string {
 		return v
 	}
 	return v[:n]
+}
+
+func buildCodexEnv() []string {
+	key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	if key == "" {
+		return nil
+	}
+	return []string{"OPENAI_API_KEY=" + key}
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {
