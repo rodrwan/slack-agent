@@ -15,6 +15,9 @@ type Config struct {
 	DatabasePath         string
 	WorkspaceRoot        string
 	CodexCommand         string
+	AgentOutputMode      string
+	AgentOutputSchemaVer string
+	SlackLogMode         string
 	CodexTimeout         time.Duration
 	RunnerInactivity     time.Duration
 	MaxConcurrentJobs    int
@@ -36,6 +39,9 @@ func Load() Config {
 		DatabasePath:         dbPath,
 		WorkspaceRoot:        workspaceRoot,
 		CodexCommand:         envOrDefault("CODEX_COMMAND", "codex exec"),
+		AgentOutputMode:      envOrDefault("AGENT_OUTPUT_MODE", "structured"),
+		AgentOutputSchemaVer: envOrDefault("AGENT_OUTPUT_SCHEMA_VERSION", "v1"),
+		SlackLogMode:         envOrDefault("SLACK_LOG_MODE", "summary"),
 		CodexTimeout:         durationOrDefault("CODEX_TIMEOUT", 30*time.Minute),
 		RunnerInactivity:     durationOrDefault("RUNNER_INACTIVITY_TIMEOUT", 45*time.Second),
 		MaxConcurrentJobs:    intOrDefault("MAX_CONCURRENT_JOBS", 2),

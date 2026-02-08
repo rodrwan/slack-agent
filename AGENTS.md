@@ -30,13 +30,18 @@ Estructura base implementada y funcional:
 - `.cache/` está ignorado por git.
 3. Integración Slack actual es por endpoints HTTP (Events/Interactions/Commands), no Socket Mode.
 4. Multi-repo soportado por comando `/codex repo=org/repo ...` usando una credencial GitHub global actual.
+5. Salida de Codex en Slack por defecto es estructurada (`AGENT_OUTPUT_MODE=structured`) con parseo JSON, reintento automático 1 vez y degradación a extracto limpio si no cumple contrato.
 
 ## 4) Variables de entorno relevantes
 Ver `.env.example` y `README.md`. Críticas:
 - `SLACK_BOT_TOKEN`
 - `SLACK_SIGNING_SECRET`
 - `GITHUB_TOKEN`
+- `OPENAI_API_KEY`
 - `CODEX_COMMAND`
+- `AGENT_OUTPUT_MODE`
+- `AGENT_OUTPUT_SCHEMA_VERSION`
+- `SLACK_LOG_MODE`
 - `DB_PATH`
 - `WORKSPACE_ROOT`
 

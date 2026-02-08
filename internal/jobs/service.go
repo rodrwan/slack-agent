@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -45,35 +46,44 @@ type GitHubClient interface {
 }
 
 type Service struct {
-	store       Store
-	notifier    SlackNotifier
-	runner      *runner.Runner
-	policy      *policy.Engine
-	git         GitManager
-	github      GitHubClient
-	codexCmd    string
-	inactivity  time.Duration
-	execTimeout time.Duration
+	store        Store
+	notifier     SlackNotifier
+	runner       *runner.Runner
+	policy       *policy.Engine
+	git          GitManager
+	github       GitHubClient
+	codexCmd     string
+	outputMode   string
+	schemaVer    string
+	slackLogMode string
+	inactivity   time.Duration
+	execTimeout  time.Duration
 
 	queue    chan string
 	repoLock sync.Map
 }
 
-func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd string, inactivity, execTimeout time.Duration, workers int) *Service {
+func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
 	if workers < 1 {
 		workers = 1
 	}
 	s := &Service{
-		store:       store,
-		notifier:    notifier,
-		runner:      run,
-		policy:      pol,
-		git:         gm,
-		github:      gh,
-		codexCmd:    codexCmd,
-		inactivity:  inactivity,
-		execTimeout: execTimeout,
-		queue:       make(chan string, 128),
+		store:        store,
+		notifier:     notifier,
+		runner:       run,
+		policy:       pol,
+		git:          gm,
+		github:       gh,
+		codexCmd:     codexCmd,
+		outputMode:   normalizeOutputMode(outputMode),
+		schemaVer:    strings.TrimSpace(schemaVer),
+		slackLogMode: normalizeLogMode(slackLogMode),
+		inactivity:   inactivity,
+		execTimeout:  execTimeout,
+		queue:        make(chan string, 128),
+	}
+	if s.schemaVer == "" {
+		s.schemaVer = "v1"
 	}
 	for i := 0; i < workers; i++ {
 		go s.worker()
@@ -181,48 +191,27 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		}
 	}
 
-	command := strings.TrimSpace(s.codexCmd + " " + shellQuote(j.Prompt+"\n"+j.LastInput))
 	codexEnv := buildCodexEnv()
-	if strings.Contains(strings.ToLower(s.codexCmd), "codex") {
+	if strings.Contains(strings.ToLower(s.codexCmd), "codex") && s.slackLogMode == LogModeStream {
 		diag := "OPENAI_API_KEY missing"
 		if len(codexEnv) > 0 {
 			diag = fmt.Sprintf("OPENAI_API_KEY present (len=%d)", len(strings.TrimPrefix(codexEnv[0], "OPENAI_API_KEY=")))
 		}
 		_ = s.notifier.PostJobLog(context.Background(), j, "[diag] "+diag)
 	}
-	pd := s.policy.Evaluate(command)
-	switch pd.Decision {
-	case policy.Deny:
-		return s.failJob(ctx, j, errors.New(pd.Reason))
-	case policy.NeedsApproval:
-		j.Status = model.StatusNeedsApproval
-		j.LastError = pd.Reason
-		if err := s.store.UpdateJob(j); err != nil {
-			return err
-		}
-		actions := []map[string]any{
-			{"type": "button", "action_id": "allow_once", "text": map[string]any{"type": "plain_text", "text": "Allow once"}, "value": j.ID, "style": "primary"},
-			{"type": "button", "action_id": "deny", "text": map[string]any{"type": "plain_text", "text": "Deny"}, "value": j.ID, "style": "danger"},
-		}
-		return s.notifier.PostJobStatus(ctx, j, "Acción requiere aprobación: "+pd.Reason, actions)
+
+	promptText := strings.TrimSpace(j.Prompt + "\n" + j.LastInput)
+	if s.outputMode == OutputModeStructured {
+		promptText = buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, false)
 	}
 
-	res, runErr := s.runner.Run(ctx, runner.Spec{
-		WorkspacePath:     j.WorkspacePath,
-		Command:           command,
-		Env:               codexEnv,
-		InactivityTimeout: s.inactivity,
-		ExecutionTimeout:  s.execTimeout,
-	}, func(line string) {
-		if strings.TrimSpace(line) != "" {
-			s.notifier.PostJobLog(context.Background(), j, line)
-		}
-	})
-
+	res, runErr, policyErr := s.runCodexOnce(ctx, j, promptText, codexEnv)
+	if policyErr != nil {
+		return policyErr
+	}
 	if res.CombinedOutput != "" {
 		s.store.AddEvent(j.ID, "runner_output", trimForStore(res.CombinedOutput, 8000))
 	}
-
 	if errors.Is(runErr, runner.ErrNeedsInput) || res.NeedsInput {
 		j.Status = model.StatusNeedsInput
 		j.LastError = "runner quedó esperando input"
@@ -236,10 +225,74 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		return s.notifier.PostJobStatus(ctx, j, "Codex necesita input. Responde en el thread con contexto adicional y luego pulsa Resume.", actions)
 	}
 	if runErr != nil || res.ExitErr != nil {
+		s.postFailureContext(j, res.CombinedOutput)
 		if runErr != nil {
 			return s.failJob(ctx, j, runErr)
 		}
 		return s.failJob(ctx, j, res.ExitErr)
+	}
+
+	var parsed structuredOutput
+	if s.outputMode == OutputModeStructured {
+		parsed, err = parseStructuredOutput(res.CombinedOutput)
+		if err != nil {
+			s.store.AddEvent(j.ID, "output_parse_failed", trimForStore(err.Error(), 1000))
+			if s.slackLogMode != LogModeStream {
+				_ = s.notifier.PostJobLog(ctx, j, "La salida no cumplió el formato esperado; reintentando en modo estructurado.")
+			}
+			retryPrompt := buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, true)
+			retryRes, retryErr, retryPolicyErr := s.runCodexOnce(ctx, j, retryPrompt, codexEnv)
+			if retryPolicyErr != nil {
+				return retryPolicyErr
+			}
+			res = retryRes
+			if retryRes.CombinedOutput != "" {
+				s.store.AddEvent(j.ID, "runner_output_retry", trimForStore(retryRes.CombinedOutput, 8000))
+			}
+			if errors.Is(retryErr, runner.ErrNeedsInput) || retryRes.NeedsInput {
+				j.Status = model.StatusNeedsInput
+				j.LastError = "runner quedó esperando input"
+				if upErr := s.store.UpdateJob(j); upErr != nil {
+					return upErr
+				}
+				actions := []map[string]any{
+					{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
+					{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
+				}
+				return s.notifier.PostJobStatus(ctx, j, "Codex necesita input. Responde en el thread con contexto adicional y luego pulsa Resume.", actions)
+			}
+			if retryErr != nil || retryRes.ExitErr != nil {
+				s.postFailureContext(j, retryRes.CombinedOutput)
+				if retryErr != nil {
+					return s.failJob(ctx, j, retryErr)
+				}
+				return s.failJob(ctx, j, retryRes.ExitErr)
+			}
+			parsed, err = parseStructuredOutput(retryRes.CombinedOutput)
+			if err != nil {
+				s.store.AddEvent(j.ID, "output_parse_failed_final", trimForStore(err.Error(), 1000))
+				if s.slackLogMode != LogModeStream {
+					fallback := sanitizeOutputForSlack(retryRes.CombinedOutput, 1800)
+					if fallback != "" {
+						_ = s.notifier.PostJobLog(ctx, j, "*Salida degradada*\n```"+escapeBackticksForSlack(fallback)+"```")
+					}
+				}
+			}
+		}
+	}
+
+	if s.slackLogMode != LogModeStream {
+		if parsed.TaskSummary != "" {
+			if payload, mErr := json.Marshal(parsed); mErr == nil {
+				s.store.AddEvent(j.ID, "structured_output", trimForStore(string(payload), 8000))
+			}
+			_ = s.notifier.PostJobLog(ctx, j, formatStructuredSummary(parsed))
+		} else {
+			preview := sanitizeOutputForSlack(res.CombinedOutput, 1600)
+			if preview != "" {
+				_ = s.notifier.PostJobLog(ctx, j, "*Salida de Codex*\n```"+escapeBackticksForSlack(preview)+"```")
+			}
+		}
 	}
 
 	diff, err := s.git.DiffStat(ctx, j.WorkspacePath)
@@ -286,12 +339,63 @@ func trimForStore(v string, n int) string {
 	return v[:n]
 }
 
+func escapeBackticksForSlack(v string) string {
+	return strings.ReplaceAll(v, "`", "'")
+}
+
 func buildCodexEnv() []string {
 	key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if key == "" {
 		return nil
 	}
 	return []string{"OPENAI_API_KEY=" + key}
+}
+
+func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, codexEnv []string) (runner.Result, error, error) {
+	command := strings.TrimSpace(s.codexCmd + " " + shellQuote(prompt))
+	pd := s.policy.Evaluate(command)
+	switch pd.Decision {
+	case policy.Deny:
+		return runner.Result{}, nil, s.failJob(ctx, j, errors.New(pd.Reason))
+	case policy.NeedsApproval:
+		j.Status = model.StatusNeedsApproval
+		j.LastError = pd.Reason
+		if err := s.store.UpdateJob(j); err != nil {
+			return runner.Result{}, nil, err
+		}
+		actions := []map[string]any{
+			{"type": "button", "action_id": "allow_once", "text": map[string]any{"type": "plain_text", "text": "Allow once"}, "value": j.ID, "style": "primary"},
+			{"type": "button", "action_id": "deny", "text": map[string]any{"type": "plain_text", "text": "Deny"}, "value": j.ID, "style": "danger"},
+		}
+		return runner.Result{}, nil, s.notifier.PostJobStatus(ctx, j, "Acción requiere aprobación: "+pd.Reason, actions)
+	}
+	var onLine func(string)
+	if s.slackLogMode == LogModeStream {
+		onLine = func(line string) {
+			if strings.TrimSpace(line) != "" {
+				_ = s.notifier.PostJobLog(context.Background(), j, line)
+			}
+		}
+	}
+	res, runErr := s.runner.Run(ctx, runner.Spec{
+		WorkspacePath:     j.WorkspacePath,
+		Command:           command,
+		Env:               codexEnv,
+		InactivityTimeout: s.inactivity,
+		ExecutionTimeout:  s.execTimeout,
+	}, onLine)
+	return res, runErr, nil
+}
+
+func (s *Service) postFailureContext(j model.Job, output string) {
+	if s.slackLogMode == LogModeStream {
+		return
+	}
+	tail := extractErrorTail(output, 24, 1800)
+	if tail == "" {
+		return
+	}
+	_ = s.notifier.PostJobLog(context.Background(), j, "*Contexto de error*\n```"+escapeBackticksForSlack(tail)+"```")
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {

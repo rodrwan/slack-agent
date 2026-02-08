@@ -63,6 +63,9 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 | `SLACK_SIGNING_SECRET` | no | empty | Slack request signature validation |
 | `CODEX_COMMAND` | no | `codex exec` | Command used to run Codex in non-interactive mode |
 | `OPENAI_API_KEY` | yes | - | API key used by Codex CLI |
+| `AGENT_OUTPUT_MODE` | no | `structured` | `structured` enforces JSON contract; `raw` keeps plain output |
+| `AGENT_OUTPUT_SCHEMA_VERSION` | no | `v1` | Structured output schema version |
+| `SLACK_LOG_MODE` | no | `summary` | `summary` sends human-readable summaries; `stream` sends raw line-by-line logs |
 | `CODEX_TIMEOUT` | no | `30m` | Max Codex run time |
 | `RUNNER_INACTIVITY_TIMEOUT` | no | `45s` | Idle timeout before `needs_input` |
 | `MAX_CONCURRENT_JOBS` | no | `2` | Worker concurrency |
@@ -97,6 +100,9 @@ docker run --rm -p 8080:8080 \
   -e GITHUB_TOKEN \
   -e OPENAI_API_KEY \
   -e CODEX_COMMAND="codex exec" \
+  -e AGENT_OUTPUT_MODE=structured \
+  -e AGENT_OUTPUT_SCHEMA_VERSION=v1 \
+  -e SLACK_LOG_MODE=summary \
   -v $(pwd)/.data:/data \
   slack-codex-runner
 ```
@@ -105,7 +111,7 @@ docker run --rm -p 8080:8080 \
 
 1. Create service from this repo.
 2. Add a persistent volume mounted at `/data`.
-3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`).
+3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`, `AGENT_OUTPUT_MODE`, `AGENT_OUTPUT_SCHEMA_VERSION`, `SLACK_LOG_MODE`).
 4. Expose port `8080` and use healthcheck `/healthz`.
 5. Configure Slack URLs with your Railway public URL.
 
@@ -125,6 +131,10 @@ During execution:
   - `Run tests`
   - `Approve & Create PR`
   - `Abort`
+- Default output behavior is structured:
+  - Codex receives a JSON contract prompt.
+  - Bot retries once if output is not valid JSON.
+  - Bot posts a readable Spanish summary in the thread.
 
 For thread input on `needs_input`, post:
 
@@ -148,7 +158,7 @@ Run tests:
 
 ```bash
 mkdir -p .cache/go-build
-GOCACHE=20 20 12 61 79 80 81 98 33 100 204 250 395 398 399 400 701pwd)/.cache/go-build go test ./...
+GOCACHE=$(pwd)/.cache/go-build go test ./...
 ```
 
 Main folders:
