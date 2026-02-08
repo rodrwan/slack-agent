@@ -222,7 +222,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
 			{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
 		}
-		return s.notifier.PostJobStatus(ctx, j, "Codex necesita input. Responde en el thread con contexto adicional y luego pulsa Resume.", actions)
+		return s.notifier.PostJobStatus(ctx, j, buildNeedsInputStatus(j.ID, res.CombinedOutput), actions)
 	}
 	if runErr != nil || res.ExitErr != nil {
 		s.postFailureContext(j, res.CombinedOutput)
@@ -259,7 +259,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 					{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
 					{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
 				}
-				return s.notifier.PostJobStatus(ctx, j, "Codex necesita input. Responde en el thread con contexto adicional y luego pulsa Resume.", actions)
+				return s.notifier.PostJobStatus(ctx, j, buildNeedsInputStatus(j.ID, retryRes.CombinedOutput), actions)
 			}
 			if retryErr != nil || retryRes.ExitErr != nil {
 				s.postFailureContext(j, retryRes.CombinedOutput)
@@ -396,6 +396,18 @@ func (s *Service) postFailureContext(j model.Job, output string) {
 		return
 	}
 	_ = s.notifier.PostJobLog(context.Background(), j, "*Contexto de error*\n```"+escapeBackticksForSlack(tail)+"```")
+}
+
+func buildNeedsInputStatus(jobID, output string) string {
+	contextTail := extractErrorTail(output, 10, 700)
+	msg := "Codex se quedó esperando más contexto.\n"
+	msg += "Si no quieres agregar nada, pulsa *Resume* y continúa con la estrategia actual.\n"
+	msg += "Si quieres orientar mejor el resultado, responde en este thread usando:\n"
+	msg += "`" + jobID + " <tu instrucción>`"
+	if contextTail != "" {
+		msg += "\n\nÚltimo contexto observado:\n```" + escapeBackticksForSlack(contextTail) + "```"
+	}
+	return msg
 }
 
 func (s *Service) HandleThreadInput(jobID, text string) error {
