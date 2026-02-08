@@ -93,7 +93,7 @@ func (s *Service) RecoverPendingJobs() {
 	}
 }
 
-func (s *Service) CreateAndQueueJob(ctx context.Context, repo, baseBranch, prompt, channelID, userID string) (model.Job, error) {
+func (s *Service) CreateAndQueueJob(_ context.Context, repo, baseBranch, prompt, channelID, userID string) (model.Job, error) {
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
 	j := model.Job{
 		ID:             jobID,
@@ -113,9 +113,14 @@ func (s *Service) CreateAndQueueJob(ctx context.Context, repo, baseBranch, promp
 		log.Printf("add event failed: %v", err)
 	}
 
-	if err := s.notifier.PostJobStatus(ctx, j, "Job creado y en cola.", nil); err != nil {
-		log.Printf("notify queued failed: %v", err)
-	}
+	// Avoid blocking slash-command acknowledgement on outbound Slack API latency.
+	go func(job model.Job) {
+		postCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := s.notifier.PostJobStatus(postCtx, job, "Job creado y en cola.", nil); err != nil {
+			log.Printf("notify queued failed: %v", err)
+		}
+	}(j)
 	stored, err := s.store.GetJob(jobID)
 	if err == nil && stored.SlackThreadTS == "" {
 		stored.SlackThreadTS = j.SlackThreadTS

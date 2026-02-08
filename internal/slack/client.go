@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type Client struct {
@@ -30,7 +31,12 @@ type postMessageResponse struct {
 }
 
 func NewClient(token string) *Client {
-	return &Client{token: token, http: &http.Client{}}
+	return &Client{
+		token: token,
+		http: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
 }
 
 func (c *Client) PostMessage(ctx context.Context, channel, threadTS, text string, blocks any) (string, error) {
