@@ -19,7 +19,7 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.25.4+
 - `git` binary available
 - Codex CLI installed and reachable as `CODEX_COMMAND` (default: `codex`)
 - Slack app with bot token + signing secret
@@ -62,6 +62,7 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 | `SLACK_BOT_TOKEN` | yes | - | Slack bot token |
 | `SLACK_SIGNING_SECRET` | no | empty | Slack request signature validation |
 | `CODEX_COMMAND` | no | `codex` | Command used to run Codex |
+| `OPENAI_API_KEY` | yes | - | API key used by Codex CLI |
 | `CODEX_TIMEOUT` | no | `30m` | Max Codex run time |
 | `RUNNER_INACTIVITY_TIMEOUT` | no | `45s` | Idle timeout before `needs_input` |
 | `MAX_CONCURRENT_JOBS` | no | `2` | Worker concurrency |
@@ -94,6 +95,7 @@ docker run --rm -p 8080:8080 \
   -e SLACK_BOT_TOKEN \
   -e SLACK_SIGNING_SECRET \
   -e GITHUB_TOKEN \
+  -e OPENAI_API_KEY \
   -e CODEX_COMMAND=codex \
   -v $(pwd)/.data:/data \
   slack-codex-runner
@@ -103,7 +105,7 @@ docker run --rm -p 8080:8080 \
 
 1. Create service from this repo.
 2. Add a persistent volume mounted at `/data`.
-3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `CODEX_COMMAND`).
+3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`).
 4. Expose port `8080` and use healthcheck `/healthz`.
 5. Configure Slack URLs with your Railway public URL.
 

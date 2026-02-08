@@ -7,7 +7,8 @@ COPY internal ./internal
 RUN go build -o /out/slack-codex-runner ./cmd/bot
 
 FROM alpine:3.20
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates nodejs npm \
+    && npm install -g @openai/codex
 WORKDIR /app
 COPY --from=build /out/slack-codex-runner /usr/local/bin/slack-codex-runner
 ENV ADDR=:8080 DATA_DIR=/data DB_PATH=/data/state.db WORKSPACE_ROOT=/data/workspaces
