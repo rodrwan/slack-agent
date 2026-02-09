@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -26,6 +27,18 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	}
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
+	}
+	// Use one connection to avoid writer lock contention across pooled conns.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		return nil, fmt.Errorf("set journal_mode: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON;`); err != nil {
+		return nil, fmt.Errorf("set foreign_keys: %w", err)
 	}
 	s := &SQLiteStore{db: db}
 	if err := s.migrate(); err != nil {
@@ -92,12 +105,15 @@ func parseTime(v string) time.Time {
 }
 
 func (s *SQLiteStore) CreateJob(j model.Job) error {
-	_, err := s.db.Exec(`
-INSERT INTO jobs (id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id, workspace_path, job_branch, last_input, last_error, last_diff_stat, pr_url)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.ID, j.Repo, j.BaseBranch, j.Prompt, string(j.Status), now(), now(), j.SlackChannelID, j.SlackThreadTS, j.SlackUserID,
-		j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL,
-	)
+	err := s.execWithRetry(func() error {
+		_, e := s.db.Exec(`
+	INSERT INTO jobs (id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id, workspace_path, job_branch, last_input, last_error, last_diff_stat, pr_url)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			j.ID, j.Repo, j.BaseBranch, j.Prompt, string(j.Status), now(), now(), j.SlackChannelID, j.SlackThreadTS, j.SlackUserID,
+			j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL,
+		)
+		return e
+	})
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -128,12 +144,15 @@ FROM jobs WHERE id = ?`, jobID)
 }
 
 func (s *SQLiteStore) UpdateJob(j model.Job) error {
-	_, err := s.db.Exec(`
-UPDATE jobs
-SET status=?, updated_at=?, workspace_path=?, job_branch=?, last_input=?, last_error=?, last_diff_stat=?, pr_url=?, slack_thread_ts=?
-WHERE id=?`,
-		string(j.Status), now(), j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL, j.SlackThreadTS, j.ID,
-	)
+	err := s.execWithRetry(func() error {
+		_, e := s.db.Exec(`
+	UPDATE jobs
+	SET status=?, updated_at=?, workspace_path=?, job_branch=?, last_input=?, last_error=?, last_diff_stat=?, pr_url=?, slack_thread_ts=?
+	WHERE id=?`,
+			string(j.Status), now(), j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL, j.SlackThreadTS, j.ID,
+		)
+		return e
+	})
 	if err != nil {
 		return fmt.Errorf("update job: %w", err)
 	}
@@ -141,13 +160,43 @@ WHERE id=?`,
 }
 
 func (s *SQLiteStore) AddEvent(jobID, eventType, payload string) error {
-	_, err := s.db.Exec(`
-INSERT INTO job_events(job_id, type, payload, created_at)
-VALUES (?, ?, ?, ?)`, jobID, eventType, payload, now())
+	err := s.execWithRetry(func() error {
+		_, e := s.db.Exec(`
+	INSERT INTO job_events(job_id, type, payload, created_at)
+	VALUES (?, ?, ?, ?)`, jobID, eventType, payload, now())
+		return e
+	})
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) execWithRetry(fn func() error) error {
+	const maxAttempts = 5
+	backoff := 40 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := fn(); err != nil {
+			lastErr = err
+			if !isSQLiteBusyErr(err) || attempt == maxAttempts {
+				return err
+			}
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func isSQLiteBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToUpper(err.Error())
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "DATABASE IS LOCKED")
 }
 
 func (s *SQLiteStore) ListRecoverableJobs() ([]model.Job, error) {
