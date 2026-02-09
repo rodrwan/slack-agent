@@ -27,6 +27,8 @@ type Config struct {
 	GitHubAPIBaseURL     string
 	DefaultBaseBranch    string
 	AllowAlwaysRepoScope bool
+	NoDiffAutoRetry      bool
+	NoDiffAutoRetryMax   int
 }
 
 func Load() Config {
@@ -53,6 +55,8 @@ func Load() Config {
 		GitHubAPIBaseURL:     strings.TrimRight(envOrDefault("GITHUB_API_BASE_URL", "https://api.github.com"), "/"),
 		DefaultBaseBranch:    envOrDefault("DEFAULT_BASE_BRANCH", "main"),
 		AllowAlwaysRepoScope: boolOrDefault("ALLOW_ALWAYS_REPO_SCOPE", false),
+		NoDiffAutoRetry:      boolOrDefault("NO_DIFF_AUTO_RETRY", true),
+		NoDiffAutoRetryMax:   intOrDefault("NO_DIFF_AUTO_RETRY_MAX", 1),
 	}
 }
 

@@ -27,3 +27,23 @@ func TestParseCommandTextDefaults(t *testing.T) {
 		t.Fatalf("unexpected parse: %s %s %s", repo, branch, prompt)
 	}
 }
+
+func TestInteractionThreadTS(t *testing.T) {
+	var p interactionPayload
+	p.Container.ThreadTS = "123.456"
+	if got := interactionThreadTS(p); got != "123.456" {
+		t.Fatalf("expected container thread ts, got %q", got)
+	}
+
+	p = interactionPayload{}
+	p.Message.ThreadTS = "222.333"
+	if got := interactionThreadTS(p); got != "222.333" {
+		t.Fatalf("expected message thread ts, got %q", got)
+	}
+
+	p = interactionPayload{}
+	p.Message.TS = "999.000"
+	if got := interactionThreadTS(p); got != "999.000" {
+		t.Fatalf("expected fallback message ts, got %q", got)
+	}
+}

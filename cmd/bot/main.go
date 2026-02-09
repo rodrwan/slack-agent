@@ -47,6 +47,8 @@ func main() {
 		cfg.RunnerInactivity,
 		cfg.CodexTimeout,
 		cfg.MaxConcurrentJobs,
+		cfg.NoDiffAutoRetry,
+		cfg.NoDiffAutoRetryMax,
 	)
 	srv.SetJobs(svc)
 	svc.RecoverPendingJobs()

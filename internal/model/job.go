@@ -31,6 +31,7 @@ type Job struct {
 	LastInput      string
 	LastError      string
 	LastDiffStat   string
+	NoDiffRetries  int
 	PRURL          string
 }
 

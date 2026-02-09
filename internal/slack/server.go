@@ -163,6 +163,10 @@ type interactionPayload struct {
 	Container struct {
 		ThreadTS string `json:"thread_ts"`
 	} `json:"container"`
+	Message struct {
+		ThreadTS string `json:"thread_ts"`
+		TS       string `json:"ts"`
+	} `json:"message"`
 	Actions []struct {
 		ActionID string `json:"action_id"`
 		Value    string `json:"value"`
@@ -216,21 +220,23 @@ func (s *Server) handleInteractions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(p.Actions) == 0 {
+		threadTS := interactionThreadTS(p)
 		observability.Info("slack_interaction_no_actions", observability.Fields{
 			"request_id": reqID,
 			"channel_id": p.Channel.ID,
 			"user_id":    p.User.ID,
-			"thread_ts":  p.Container.ThreadTS,
+			"thread_ts":  threadTS,
 		})
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	a := p.Actions[0]
+	threadTS := interactionThreadTS(p)
 	observability.Info("slack_interaction_action_received", observability.Fields{
 		"request_id": reqID,
 		"channel_id": p.Channel.ID,
 		"user_id":    p.User.ID,
-		"thread_ts":  p.Container.ThreadTS,
+		"thread_ts":  threadTS,
 		"action_id":  a.ActionID,
 		"value":      a.Value,
 	})
@@ -468,6 +474,16 @@ func (s *Server) requestID(r *http.Request) string {
 	}
 	n := atomic.AddUint64(&s.requestSeq, 1)
 	return fmt.Sprintf("req-%d-%d", time.Now().UTC().UnixNano(), n)
+}
+
+func interactionThreadTS(p interactionPayload) string {
+	if v := strings.TrimSpace(p.Container.ThreadTS); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(p.Message.ThreadTS); v != "" {
+		return v
+	}
+	return strings.TrimSpace(p.Message.TS)
 }
 
 func escapeBackticks(v string) string {

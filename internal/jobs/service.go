@@ -64,6 +64,8 @@ type Service struct {
 	slackLogMode string
 	inactivity   time.Duration
 	execTimeout  time.Duration
+	noDiffRetry  bool
+	noDiffMax    int
 
 	queue    chan string
 	repoLock sync.Map
@@ -84,7 +86,7 @@ type chatSession struct {
 
 var rateLimitRetryRe = regexp.MustCompile(`Please try again in ([0-9]+(?:\.[0-9]+)?)s`)
 
-func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, codexSandbox, codexModel, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int) *Service {
+func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *policy.Engine, gm GitManager, gh GitHubClient, codexCmd, codexSandbox, codexModel, outputMode, schemaVer, slackLogMode string, inactivity, execTimeout time.Duration, workers int, noDiffRetry bool, noDiffMax int) *Service {
 	if workers < 1 {
 		workers = 1
 	}
@@ -103,7 +105,12 @@ func NewService(store Store, notifier SlackNotifier, run *runner.Runner, pol *po
 		slackLogMode: normalizeLogMode(slackLogMode),
 		inactivity:   inactivity,
 		execTimeout:  execTimeout,
+		noDiffRetry:  noDiffRetry,
+		noDiffMax:    noDiffMax,
 		queue:        make(chan string, 128),
+	}
+	if s.noDiffMax < 1 {
+		s.noDiffMax = 1
 	}
 	if s.schemaVer == "" {
 		s.schemaVer = "v1"
@@ -463,7 +470,29 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			"error":  err.Error(),
 		})
 	}
+	statusPreview, changedFiles, changedCount := s.collectGitChangeDiagnostics(ctx, j.WorkspacePath)
+	observability.Info("job_git_change_diagnostics", observability.Fields{
+		"job_id":                j.ID,
+		"changed_files_count":   changedCount,
+		"status_preview_len":    len(statusPreview),
+		"changed_files_preview": changedFiles,
+	})
 	if !hasMeaningfulDiff(diff) {
+		if s.shouldAutoRetryNoDiff(j) {
+			j.NoDiffRetries++
+			j.LastError = "no se detectaron cambios; reintentando con instrucción adicional"
+			j.Status = model.StatusQueued
+			j.LastInput = strings.TrimSpace(strings.TrimSpace(j.LastInput) + "\n" + buildNoDiffRetryInstruction())
+			if err := s.store.UpdateJob(j); err != nil {
+				return err
+			}
+			s.store.AddEvent(j.ID, "no_diff_retry_started", fmt.Sprintf("attempt=%d/%d changed_files=%d", j.NoDiffRetries, s.noDiffMax, changedCount))
+			if s.slackLogMode != LogModeStream {
+				_ = s.notifier.PostJobLog(ctx, j, fmt.Sprintf("No detecté cambios en archivos. Reintentando automáticamente (%d/%d) con instrucción más explícita.", j.NoDiffRetries, s.noDiffMax))
+			}
+			s.Enqueue(j.ID)
+			return nil
+		}
 		j.LastDiffStat = "(sin cambios detectados)"
 		j.Status = model.StatusNeedsInput
 		j.LastError = "no se detectaron cambios para revisar"
@@ -481,7 +510,7 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
 			{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
 		}
-		return s.notifier.PostJobStatus(ctx, j, buildNoDiffNeedsInputStatus(j.ID), actions)
+		return s.notifier.PostJobStatus(ctx, j, buildNoDiffNeedsInputStatus(j.ID, statusPreview, changedFiles), actions)
 	}
 	if s.slackLogMode != LogModeStream && parsed.TaskSummary == "" {
 		_ = s.notifier.PostJobLog(ctx, j, "No hubo resumen estructurado disponible. Se detectaron cambios; revisa diff y acciones de revisión.")
@@ -692,17 +721,63 @@ func buildNeedsInputStatus(jobID, output string) string {
 	return msg
 }
 
-func buildNoDiffNeedsInputStatus(jobID string) string {
+func buildNoDiffNeedsInputStatus(jobID, statusPreview, changedFiles string) string {
 	msg := "No detecté cambios en el workspace, así que no puedo abrir revisión todavía.\n"
 	msg += "Responde en este thread con más contexto o una instrucción concreta de implementación y luego pulsa *Resume*.\n"
 	msg += "Formato recomendado:\n"
-	msg += "`" + jobID + " <qué quieres cambiar exactamente>`"
+	msg += "`" + jobID + " <qué archivos quieres cambiar y criterio de aceptación>`"
+	if strings.TrimSpace(changedFiles) != "" {
+		msg += "\n\nArchivos detectados como cambiados:\n```" + escapeBackticksForSlack(changedFiles) + "```"
+	} else if strings.TrimSpace(statusPreview) != "" {
+		msg += "\n\nEstado git observado:\n```" + escapeBackticksForSlack(statusPreview) + "```"
+	}
 	return msg
 }
 
 func hasMeaningfulDiff(diff string) bool {
 	v := strings.TrimSpace(diff)
 	return v != "" && v != "(sin cambios detectados)"
+}
+
+func buildNoDiffRetryInstruction() string {
+	return "Instruccion de correccion automatica: en la siguiente respuesta debes aplicar cambios reales sobre archivos del repositorio. " +
+		"Edita archivos concretos, explica que cambiaste, y termina listando paths modificados. " +
+		"Si necesitas aclaracion, pídela de forma explicita."
+}
+
+func (s *Service) shouldAutoRetryNoDiff(j model.Job) bool {
+	return s.noDiffRetry && j.NoDiffRetries < s.noDiffMax
+}
+
+func (s *Service) collectGitChangeDiagnostics(ctx context.Context, workspacePath string) (statusPreview, changedFiles string, changedCount int) {
+	statusPreview = strings.TrimSpace(s.runWorkspaceCommand(ctx, workspacePath, "git status --porcelain"))
+	changedFiles = strings.TrimSpace(s.runWorkspaceCommand(ctx, workspacePath, "git diff --name-only"))
+	if changedFiles != "" {
+		for _, ln := range strings.Split(changedFiles, "\n") {
+			if strings.TrimSpace(ln) != "" {
+				changedCount++
+			}
+		}
+	}
+	return statusPreview, changedFiles, changedCount
+}
+
+func (s *Service) runWorkspaceCommand(ctx context.Context, workspacePath, command string) string {
+	if s.runner == nil {
+		return ""
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	res, err := s.runner.Run(runCtx, runner.Spec{
+		WorkspacePath:     workspacePath,
+		Command:           command,
+		InactivityTimeout: 5 * time.Second,
+		ExecutionTimeout:  10 * time.Second,
+	}, nil)
+	if err != nil || res.ExitErr != nil {
+		return ""
+	}
+	return sanitizeOutputForSlack(res.CombinedOutput, 1200)
 }
 
 func (s *Service) buildCodexCommand(prompt, schemaPath string) string {
@@ -741,6 +816,8 @@ func (s *Service) addRuntimeSnapshotEvent(jobID string) {
 		"output_mode":    s.outputMode,
 		"schema_version": s.schemaVer,
 		"log_mode":       s.slackLogMode,
+		"no_diff_retry":  strconv.FormatBool(s.noDiffRetry),
+		"no_diff_max":    strconv.Itoa(s.noDiffMax),
 	}
 	if isCodexCommand(s.codexCmd) {
 		payload["sandbox"] = s.codexSandbox
@@ -901,7 +978,7 @@ func (s *Service) ApproveAndCreatePR(jobID string) error {
 			{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
 			{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
 		}
-		return s.notifier.PostJobStatus(context.Background(), j, buildNoDiffNeedsInputStatus(j.ID), actions)
+		return s.notifier.PostJobStatus(context.Background(), j, buildNoDiffNeedsInputStatus(j.ID, "", ""), actions)
 	}
 
 	if err := s.git.CommitAll(context.Background(), j.WorkspacePath, "chore: codex job "+j.ID); err != nil {

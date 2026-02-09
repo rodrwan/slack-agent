@@ -131,3 +131,15 @@ func TestApproveAndCreatePR_BlocksWhenNoDiff(t *testing.T) {
 		t.Fatalf("unexpected notifier summary: %q", notifier.lastSummary)
 	}
 }
+
+func TestShouldAutoRetryNoDiff(t *testing.T) {
+	svc := &Service{noDiffRetry: true, noDiffMax: 1}
+	j := model.Job{NoDiffRetries: 0}
+	if !svc.shouldAutoRetryNoDiff(j) {
+		t.Fatalf("expected auto-retry enabled for first no-diff")
+	}
+	j.NoDiffRetries = 1
+	if svc.shouldAutoRetryNoDiff(j) {
+		t.Fatalf("expected auto-retry disabled after reaching max")
+	}
+}

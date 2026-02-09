@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_input TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   last_diff_stat TEXT NOT NULL DEFAULT '',
+  no_diff_retries INTEGER NOT NULL DEFAULT 0,
   pr_url TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS job_events (
@@ -88,6 +89,12 @@ CREATE INDEX IF NOT EXISTS idx_job_events_job_id ON job_events(job_id);
 	_, err := s.db.Exec(schema)
 	if err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE jobs ADD COLUMN no_diff_retries INTEGER NOT NULL DEFAULT 0`); err != nil {
+		low := strings.ToLower(err.Error())
+		if !strings.Contains(low, "duplicate column") {
+			return fmt.Errorf("migrate sqlite add no_diff_retries: %w", err)
+		}
 	}
 	return nil
 }
@@ -107,10 +114,10 @@ func parseTime(v string) time.Time {
 func (s *SQLiteStore) CreateJob(j model.Job) error {
 	err := s.execWithRetry(func() error {
 		_, e := s.db.Exec(`
-	INSERT INTO jobs (id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id, workspace_path, job_branch, last_input, last_error, last_diff_stat, pr_url)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO jobs (id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id, workspace_path, job_branch, last_input, last_error, last_diff_stat, no_diff_retries, pr_url)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			j.ID, j.Repo, j.BaseBranch, j.Prompt, string(j.Status), now(), now(), j.SlackChannelID, j.SlackThreadTS, j.SlackUserID,
-			j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL,
+			j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.NoDiffRetries, j.PRURL,
 		)
 		return e
 	})
@@ -122,9 +129,9 @@ func (s *SQLiteStore) CreateJob(j model.Job) error {
 
 func (s *SQLiteStore) GetJob(jobID string) (model.Job, error) {
 	row := s.db.QueryRow(`
-SELECT id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id,
-       workspace_path, job_branch, last_input, last_error, last_diff_stat, pr_url
-FROM jobs WHERE id = ?`, jobID)
+	SELECT id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id,
+	       workspace_path, job_branch, last_input, last_error, last_diff_stat, no_diff_retries, pr_url
+	FROM jobs WHERE id = ?`, jobID)
 	var (
 		j         model.Job
 		status    string
@@ -133,7 +140,7 @@ FROM jobs WHERE id = ?`, jobID)
 	)
 	if err := row.Scan(
 		&j.ID, &j.Repo, &j.BaseBranch, &j.Prompt, &status, &createdAt, &updatedAt, &j.SlackChannelID, &j.SlackThreadTS, &j.SlackUserID,
-		&j.WorkspacePath, &j.JobBranch, &j.LastInput, &j.LastError, &j.LastDiffStat, &j.PRURL,
+		&j.WorkspacePath, &j.JobBranch, &j.LastInput, &j.LastError, &j.LastDiffStat, &j.NoDiffRetries, &j.PRURL,
 	); err != nil {
 		return model.Job{}, err
 	}
@@ -146,10 +153,10 @@ FROM jobs WHERE id = ?`, jobID)
 func (s *SQLiteStore) UpdateJob(j model.Job) error {
 	err := s.execWithRetry(func() error {
 		_, e := s.db.Exec(`
-	UPDATE jobs
-	SET status=?, updated_at=?, workspace_path=?, job_branch=?, last_input=?, last_error=?, last_diff_stat=?, pr_url=?, slack_thread_ts=?
-	WHERE id=?`,
-			string(j.Status), now(), j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.PRURL, j.SlackThreadTS, j.ID,
+		UPDATE jobs
+		SET status=?, updated_at=?, workspace_path=?, job_branch=?, last_input=?, last_error=?, last_diff_stat=?, no_diff_retries=?, pr_url=?, slack_thread_ts=?
+		WHERE id=?`,
+			string(j.Status), now(), j.WorkspacePath, j.JobBranch, j.LastInput, j.LastError, j.LastDiffStat, j.NoDiffRetries, j.PRURL, j.SlackThreadTS, j.ID,
 		)
 		return e
 	})
@@ -201,9 +208,9 @@ func isSQLiteBusyErr(err error) bool {
 
 func (s *SQLiteStore) ListRecoverableJobs() ([]model.Job, error) {
 	rows, err := s.db.Query(`
-SELECT id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id,
-       workspace_path, job_branch, last_input, last_error, last_diff_stat, pr_url
-FROM jobs WHERE status IN ('queued', 'running', 'needs_input', 'needs_approval', 'needs_review')`)
+	SELECT id, repo, base_branch, prompt, status, created_at, updated_at, slack_channel_id, slack_thread_ts, slack_user_id,
+	       workspace_path, job_branch, last_input, last_error, last_diff_stat, no_diff_retries, pr_url
+	FROM jobs WHERE status IN ('queued', 'running', 'needs_input', 'needs_approval', 'needs_review')`)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +225,7 @@ FROM jobs WHERE status IN ('queued', 'running', 'needs_input', 'needs_approval',
 		)
 		if err := rows.Scan(
 			&j.ID, &j.Repo, &j.BaseBranch, &j.Prompt, &status, &createdAt, &updatedAt, &j.SlackChannelID, &j.SlackThreadTS, &j.SlackUserID,
-			&j.WorkspacePath, &j.JobBranch, &j.LastInput, &j.LastError, &j.LastDiffStat, &j.PRURL,
+			&j.WorkspacePath, &j.JobBranch, &j.LastInput, &j.LastError, &j.LastDiffStat, &j.NoDiffRetries, &j.PRURL,
 		); err != nil {
 			return nil, err
 		}
