@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/rodrwan/slack-codex/internal/model"
+	"github.com/rodrwan/slack-codex/internal/observability"
 	"github.com/rodrwan/slack-codex/internal/policy"
 	"github.com/rodrwan/slack-codex/internal/runner"
 )
@@ -245,16 +246,35 @@ func (s *Service) Enqueue(jobID string) {
 func (s *Service) worker() {
 	for jobID := range s.queue {
 		if err := s.runJob(context.Background(), jobID); err != nil {
-			log.Printf("job %s failed: %v", jobID, err)
+			observability.Error("job_worker_run_failed", observability.Fields{
+				"job_id": jobID,
+				"error":  err.Error(),
+			})
 		}
 	}
 }
 
 func (s *Service) runJob(ctx context.Context, jobID string) error {
+	start := time.Now()
 	j, err := s.store.GetJob(jobID)
 	if err != nil {
 		return err
 	}
+	observability.Info("job_run_started", observability.Fields{
+		"job_id":      j.ID,
+		"status":      j.Status,
+		"repo":        j.Repo,
+		"base_branch": j.BaseBranch,
+	})
+	defer func() {
+		observability.Info("job_run_finished", observability.Fields{
+			"job_id":        j.ID,
+			"status":        j.Status,
+			"duration_ms":   time.Since(start).Milliseconds(),
+			"last_error":    j.LastError,
+			"workspace_set": j.WorkspacePath != "",
+		})
+	}()
 	if model.IsTerminalStatus(j.Status) {
 		return nil
 	}
@@ -270,6 +290,11 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	if err := s.store.UpdateJob(j); err != nil {
 		return err
 	}
+	observability.Info("job_status_transition", observability.Fields{
+		"job_id": j.ID,
+		"from":   "queued_or_resumed",
+		"to":     j.Status,
+	})
 	s.notifier.PostJobStatus(ctx, j, "Ejecutando Codex en workspace aislado.", nil)
 
 	if j.WorkspacePath == "" {
@@ -279,6 +304,11 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		}
 		j.WorkspacePath = ws.Path
 		j.JobBranch = ws.JobBranch
+		observability.Info("job_workspace_prepared", observability.Fields{
+			"job_id":     j.ID,
+			"job_branch": j.JobBranch,
+			"workspace":  j.WorkspacePath,
+		})
 		if err := s.store.UpdateJob(j); err != nil {
 			return err
 		}
@@ -298,6 +328,13 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	if s.outputMode == OutputModeStructured {
 		promptText = buildCodexPrompt(j.Prompt, j.LastInput, s.schemaVer, false)
 	}
+	observability.Info("job_runner_dispatch", observability.Fields{
+		"job_id":      j.ID,
+		"output_mode": s.outputMode,
+		"schema_ver":  s.schemaVer,
+		"prompt_hash": observability.HashText(promptText),
+		"prompt_len":  len(promptText),
+	})
 
 	res, runErr, policyErr := s.runCodexWithRateLimitRetry(ctx, j, promptText, codexEnv)
 	if policyErr != nil {
@@ -309,6 +346,10 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 	if errors.Is(runErr, runner.ErrNeedsInput) || res.NeedsInput {
 		j.Status = model.StatusNeedsInput
 		j.LastError = "runner quedó esperando input"
+		observability.Warn("job_runner_needs_input", observability.Fields{
+			"job_id":       j.ID,
+			"combined_len": len(res.CombinedOutput),
+		})
 		if err := s.store.UpdateJob(j); err != nil {
 			return err
 		}
@@ -319,6 +360,12 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		return s.notifier.PostJobStatus(ctx, j, buildNeedsInputStatus(j.ID, res.CombinedOutput), actions)
 	}
 	if runErr != nil || res.ExitErr != nil {
+		observability.Error("job_runner_failed", observability.Fields{
+			"job_id":       j.ID,
+			"run_error":    errToString(runErr),
+			"exit_error":   errToString(res.ExitErr),
+			"combined_len": len(res.CombinedOutput),
+		})
 		s.postFailureContext(j, res.CombinedOutput)
 		if runErr != nil {
 			return s.failJob(ctx, j, runErr)
@@ -331,7 +378,19 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		parsed, err = parseStructuredOutput(res.CombinedOutput)
 		if err != nil {
 			causeCode, causeMsg := classifyStructuredParseFailure(err, res.CombinedOutput)
-			s.addStructuredParseEvent(j.ID, "output_parse_failed", causeCode, 0, err.Error())
+			candidates := countJSONCandidates(res.CombinedOutput)
+			observability.Warn("job_structured_parse_failed", observability.Fields{
+				"job_id":           j.ID,
+				"cause_code":       causeCode,
+				"cause_msg":        causeMsg,
+				"attempt":          0,
+				"candidates_count": candidates,
+				"combined_len":     len(res.CombinedOutput),
+			})
+			s.addStructuredParseEvent(j.ID, "output_parse_failed", causeCode, 0, fmt.Sprintf("%s | candidates=%d", err.Error(), candidates))
+			if causeCode == "json_final_no_valido" {
+				s.addStructuredParseEvent(j.ID, "output_parse_no_valid_candidate", causeCode, 0, fmt.Sprintf("candidates=%d", candidates))
+			}
 			if s.slackLogMode != LogModeStream {
 				_ = s.notifier.PostJobLog(ctx, j, "No se pudo validar salida estructurada ("+causeMsg+"). Reintentando automáticamente (intento 1/1).")
 			}
@@ -367,7 +426,19 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 			parsed, err = parseStructuredOutput(retryRes.CombinedOutput)
 			if err != nil {
 				finalCode, finalMsg := classifyStructuredParseFailure(err, retryRes.CombinedOutput)
-				s.addStructuredParseEvent(j.ID, "output_parse_failed_final", finalCode, 1, err.Error())
+				finalCandidates := countJSONCandidates(retryRes.CombinedOutput)
+				observability.Warn("job_structured_parse_failed_final", observability.Fields{
+					"job_id":           j.ID,
+					"cause_code":       finalCode,
+					"cause_msg":        finalMsg,
+					"attempt":          1,
+					"candidates_count": finalCandidates,
+					"combined_len":     len(retryRes.CombinedOutput),
+				})
+				s.addStructuredParseEvent(j.ID, "output_parse_failed_final", finalCode, 1, fmt.Sprintf("%s | candidates=%d", err.Error(), finalCandidates))
+				if finalCode == "json_final_no_valido" {
+					s.addStructuredParseEvent(j.ID, "output_parse_no_valid_candidate", finalCode, 1, fmt.Sprintf("candidates=%d", finalCandidates))
+				}
 				s.addStructuredParseEvent(j.ID, "output_degraded_continue", finalCode, 1, "continue with internal summary and diff")
 				if s.slackLogMode != LogModeStream {
 					_ = s.notifier.PostJobLog(ctx, j, "No se pudo obtener formato estructurado tras el reintento ("+finalMsg+"). Se continúa en modo degradado: resumen interno + diff para revisión.")
@@ -376,23 +447,53 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 		}
 	}
 
-	if s.slackLogMode != LogModeStream {
-		if parsed.TaskSummary != "" {
-			if payload, mErr := json.Marshal(parsed); mErr == nil {
-				s.store.AddEvent(j.ID, "structured_output", trimForStore(string(payload), 8000))
-			}
-			_ = s.notifier.PostJobLog(ctx, j, formatStructuredSummary(parsed))
-		} else {
-			_ = s.notifier.PostJobLog(ctx, j, "No hubo resumen estructurado disponible. Revisa diff y acciones de revisión para continuar.")
+	if s.slackLogMode != LogModeStream && parsed.TaskSummary != "" {
+		if payload, mErr := json.Marshal(parsed); mErr == nil {
+			s.store.AddEvent(j.ID, "structured_output", trimForStore(string(payload), 8000))
 		}
+		_ = s.notifier.PostJobLog(ctx, j, formatStructuredSummary(parsed))
 	}
 
 	diff, err := s.git.DiffStat(ctx, j.WorkspacePath)
 	if err != nil {
 		diff = "(sin cambios detectados)"
+		s.store.AddEvent(j.ID, "diff_stat_error", trimForStore(err.Error(), 600))
+		observability.Warn("job_diff_stat_failed", observability.Fields{
+			"job_id": j.ID,
+			"error":  err.Error(),
+		})
+	}
+	if !hasMeaningfulDiff(diff) {
+		j.LastDiffStat = "(sin cambios detectados)"
+		j.Status = model.StatusNeedsInput
+		j.LastError = "no se detectaron cambios para revisar"
+		if err := s.store.UpdateJob(j); err != nil {
+			return err
+		}
+		s.store.AddEvent(j.ID, "review_blocked_no_diff", "runner finished without changes")
+		observability.Warn("job_review_blocked_no_diff", observability.Fields{
+			"job_id": j.ID,
+		})
+		if s.slackLogMode != LogModeStream && parsed.TaskSummary == "" {
+			_ = s.notifier.PostJobLog(ctx, j, "No hubo resumen estructurado util y tampoco se detectaron cambios en el repositorio.")
+		}
+		actions := []map[string]any{
+			{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
+			{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
+		}
+		return s.notifier.PostJobStatus(ctx, j, buildNoDiffNeedsInputStatus(j.ID), actions)
+	}
+	if s.slackLogMode != LogModeStream && parsed.TaskSummary == "" {
+		_ = s.notifier.PostJobLog(ctx, j, "No hubo resumen estructurado disponible. Se detectaron cambios; revisa diff y acciones de revisión.")
 	}
 	j.LastDiffStat = diff
 	j.Status = model.StatusNeedsReview
+	observability.Info("job_status_transition", observability.Fields{
+		"job_id":   j.ID,
+		"from":     model.StatusRunning,
+		"to":       j.Status,
+		"diff_len": len(diff),
+	})
 	if err := s.store.UpdateJob(j); err != nil {
 		return err
 	}
@@ -407,6 +508,11 @@ func (s *Service) runJob(ctx context.Context, jobID string) error {
 func (s *Service) failJob(ctx context.Context, j model.Job, err error) error {
 	j.Status = model.StatusFailed
 	j.LastError = err.Error()
+	observability.Error("job_status_transition_failed", observability.Fields{
+		"job_id": j.ID,
+		"to":     j.Status,
+		"error":  err.Error(),
+	})
 	if upErr := s.store.UpdateJob(j); upErr != nil {
 		return upErr
 	}
@@ -435,6 +541,13 @@ func escapeBackticksForSlack(v string) string {
 	return strings.ReplaceAll(v, "`", "'")
 }
 
+func errToString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func buildCodexEnv() []string {
 	key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if key == "" {
@@ -453,7 +566,20 @@ func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, 
 		schemaPath = p
 	}
 	command := s.buildCodexCommand(prompt, schemaPath)
+	observability.Info("job_command_built", observability.Fields{
+		"job_id":         j.ID,
+		"command_hash":   observability.HashText(command),
+		"command_len":    len(command),
+		"is_codex":       isCodexCommand(s.codexCmd),
+		"schema_present": schemaPath != "",
+		"env_count":      len(codexEnv),
+	})
 	pd := s.policy.Evaluate(command)
+	observability.Info("job_policy_evaluated", observability.Fields{
+		"job_id":   j.ID,
+		"decision": pd.Decision,
+		"reason":   pd.Reason,
+	})
 	switch pd.Decision {
 	case policy.Deny:
 		return runner.Result{}, nil, s.failJob(ctx, j, errors.New(pd.Reason))
@@ -484,6 +610,13 @@ func (s *Service) runCodexOnce(ctx context.Context, j model.Job, prompt string, 
 		InactivityTimeout: s.codexInactivityTimeout(),
 		ExecutionTimeout:  s.execTimeout,
 	}, onLine)
+	observability.Info("job_runner_returned", observability.Fields{
+		"job_id":       j.ID,
+		"needs_input":  res.NeedsInput,
+		"combined_len": len(res.CombinedOutput),
+		"run_error":    errToString(runErr),
+		"exit_error":   errToString(res.ExitErr),
+	})
 	return res, runErr, nil
 }
 
@@ -506,6 +639,10 @@ func (s *Service) runCodexWithRateLimitRetry(ctx context.Context, j model.Job, p
 		wait = 2 * time.Second
 	}
 	s.store.AddEvent(j.ID, "rate_limit_retry", wait.String())
+	observability.Warn("job_rate_limit_retry", observability.Fields{
+		"job_id":   j.ID,
+		"wait_sec": int(wait.Seconds()),
+	})
 	if s.slackLogMode != LogModeStream {
 		_ = s.notifier.PostJobLog(ctx, j, fmt.Sprintf("Rate limit de OpenAI detectado. Reintentando automáticamente en %s.", wait.Round(time.Second)))
 	}
@@ -553,6 +690,19 @@ func buildNeedsInputStatus(jobID, output string) string {
 		msg += "\n\nÚltimo contexto observado:\n```" + escapeBackticksForSlack(contextTail) + "```"
 	}
 	return msg
+}
+
+func buildNoDiffNeedsInputStatus(jobID string) string {
+	msg := "No detecté cambios en el workspace, así que no puedo abrir revisión todavía.\n"
+	msg += "Responde en este thread con más contexto o una instrucción concreta de implementación y luego pulsa *Resume*.\n"
+	msg += "Formato recomendado:\n"
+	msg += "`" + jobID + " <qué quieres cambiar exactamente>`"
+	return msg
+}
+
+func hasMeaningfulDiff(diff string) bool {
+	v := strings.TrimSpace(diff)
+	return v != "" && v != "(sin cambios detectados)"
 }
 
 func (s *Service) buildCodexCommand(prompt, schemaPath string) string {
@@ -731,6 +881,27 @@ func (s *Service) ApproveAndCreatePR(jobID string) error {
 	}
 	if j.Status != model.StatusNeedsReview {
 		return nil
+	}
+	diff, err := s.git.DiffStat(context.Background(), j.WorkspacePath)
+	if err != nil {
+		diff = ""
+	}
+	if !hasMeaningfulDiff(diff) {
+		j.Status = model.StatusNeedsInput
+		j.LastDiffStat = "(sin cambios detectados)"
+		j.LastError = "no se detectaron cambios para crear PR"
+		observability.Warn("job_pr_blocked_no_diff", observability.Fields{
+			"job_id": j.ID,
+		})
+		if err := s.store.UpdateJob(j); err != nil {
+			return err
+		}
+		s.store.AddEvent(j.ID, "pr_blocked_no_diff", "approve requested without diff")
+		actions := []map[string]any{
+			{"type": "button", "action_id": "resume_default", "text": map[string]any{"type": "plain_text", "text": "Resume"}, "value": j.ID, "style": "primary"},
+			{"type": "button", "action_id": "abort", "text": map[string]any{"type": "plain_text", "text": "Abort"}, "value": j.ID, "style": "danger"},
+		}
+		return s.notifier.PostJobStatus(context.Background(), j, buildNoDiffNeedsInputStatus(j.ID), actions)
 	}
 
 	if err := s.git.CommitAll(context.Background(), j.WorkspacePath, "chore: codex job "+j.ID); err != nil {

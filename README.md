@@ -74,6 +74,9 @@ Each job uses an isolated workspace under `WORKSPACE_ROOT` and stores state in `
 | `GITHUB_TOKEN` | yes | - | Token for clone/push/PR |
 | `GITHUB_API_BASE_URL` | no | `https://api.github.com` | GitHub API base URL |
 | `DEFAULT_BASE_BRANCH` | no | `main` | Default branch if omitted |
+| `DIAG_LOG_LEVEL` | no | `basic` | Backend structured diagnostics verbosity: `basic` or `verbose` |
+| `DIAG_INCLUDE_SNIPPETS` | no | `false` | Include sanitized/truncated output snippets in backend logs |
+| `DIAG_MAX_PAYLOAD_BYTES` | no | `2048` | Max bytes per logged payload/snippet |
 
 ## Run Local
 
@@ -115,7 +118,7 @@ docker run --rm -p 8080:8080 \
 
 1. Create service from this repo.
 2. Add a persistent volume mounted at `/data`.
-3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`, `CODEX_SANDBOX_MODE`, `CODEX_MODEL`, `AGENT_OUTPUT_MODE`, `AGENT_OUTPUT_SCHEMA_VERSION`, `SLACK_LOG_MODE`).
+3. Set env vars (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `CODEX_COMMAND`, `CODEX_SANDBOX_MODE`, `CODEX_MODEL`, `AGENT_OUTPUT_MODE`, `AGENT_OUTPUT_SCHEMA_VERSION`, `SLACK_LOG_MODE`, `DIAG_LOG_LEVEL`, `DIAG_INCLUDE_SNIPPETS`, `DIAG_MAX_PAYLOAD_BYTES`).
 4. Expose port `8080` and use healthcheck `/healthz`.
 5. Configure Slack URLs with your Railway public URL.
 

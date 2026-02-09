@@ -10,9 +10,16 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/rodrwan/slack-codex/internal/observability"
 )
 
 var ErrNeedsInput = errors.New("runner appears to be waiting for input")
+
+const (
+	scannerBufferInitial = 64 * 1024
+	scannerBufferMax     = 8 * 1024 * 1024
+)
 
 type Spec struct {
 	WorkspacePath     string
@@ -33,6 +40,7 @@ type Runner struct{}
 func New() *Runner { return &Runner{} }
 
 func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (Result, error) {
+	start := time.Now()
 	if spec.Command == "" {
 		return Result{}, fmt.Errorf("runner command is empty")
 	}
@@ -42,6 +50,14 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 	if spec.InactivityTimeout <= 0 {
 		spec.InactivityTimeout = 45 * time.Second
 	}
+	observability.Info("runner_start", observability.Fields{
+		"workspace_path":     spec.WorkspacePath,
+		"command_hash":       observability.HashText(spec.Command),
+		"command_len":        len(spec.Command),
+		"env_count":          len(spec.Env),
+		"inactivity_timeout": spec.InactivityTimeout.String(),
+		"execution_timeout":  spec.ExecutionTimeout.String(),
+	})
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, spec.ExecutionTimeout)
 	defer cancel()
@@ -72,6 +88,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 	)
 
 	copyStream := func(sc *bufio.Scanner, prefix string) {
+		sc.Buffer(make([]byte, scannerBufferInitial), scannerBufferMax)
 		for sc.Scan() {
 			line := sc.Text()
 			mu.Lock()
@@ -82,6 +99,17 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 			mu.Unlock()
 			if onLine != nil {
 				onLine(prefix + line)
+			}
+		}
+		if err := sc.Err(); err != nil {
+			mu.Lock()
+			buf.WriteString(prefix)
+			buf.WriteString("scanner_error: ")
+			buf.WriteString(err.Error())
+			buf.WriteByte('\n')
+			mu.Unlock()
+			if onLine != nil {
+				onLine(prefix + "scanner_error: " + err.Error())
 			}
 		}
 		copyDone <- struct{}{}
@@ -107,8 +135,17 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 			out := buf.String()
 			mu.Unlock()
 			if err != nil {
+				observability.Warn("runner_wait_exit_error", observability.Fields{
+					"duration_ms": time.Since(start).Milliseconds(),
+					"error":       err.Error(),
+					"output_len":  len(out),
+				})
 				return Result{CombinedOutput: out, ExitErr: err}, nil
 			}
+			observability.Info("runner_wait_ok", observability.Fields{
+				"duration_ms": time.Since(start).Milliseconds(),
+				"output_len":  len(out),
+			})
 			return Result{CombinedOutput: out}, nil
 		case <-ticker.C:
 			mu.Lock()
@@ -122,6 +159,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 				mu.Lock()
 				out := buf.String()
 				mu.Unlock()
+				observability.Warn("runner_needs_input", observability.Fields{
+					"duration_ms": time.Since(start).Milliseconds(),
+					"idle_ms":     idle.Milliseconds(),
+					"output_len":  len(out),
+				})
 				return Result{CombinedOutput: out, NeedsInput: true}, ErrNeedsInput
 			}
 		case <-timeoutCtx.Done():
@@ -132,6 +174,11 @@ func (r *Runner) Run(ctx context.Context, spec Spec, onLine func(line string)) (
 			mu.Lock()
 			out := buf.String()
 			mu.Unlock()
+			observability.Error("runner_execution_timeout", observability.Fields{
+				"duration_ms": time.Since(start).Milliseconds(),
+				"output_len":  len(out),
+				"error":       timeoutCtx.Err().Error(),
+			})
 			return Result{CombinedOutput: out, ExitErr: timeoutCtx.Err()}, timeoutCtx.Err()
 		}
 	}

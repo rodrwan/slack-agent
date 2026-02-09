@@ -36,6 +36,42 @@ func TestParseStructuredOutput_MissingRequiredField(t *testing.T) {
 	}
 }
 
+func TestParseStructuredOutput_SelectsLastValidCandidate(t *testing.T) {
+	raw := `{"hello":"world"}` + "\n" +
+		`{"version":"v1","task_summary":"final","key_findings":["x"],"artifacts":[],"risks":[],"next_steps":[],"full_report_markdown":"ok"}`
+	out, err := parseStructuredOutput(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.TaskSummary != "final" {
+		t.Fatalf("expected final candidate, got %q", out.TaskSummary)
+	}
+}
+
+func TestParseStructuredOutput_FillsOptionalDefaults(t *testing.T) {
+	raw := `{"task_summary":"ok","key_findings":["a"]}`
+	out, err := parseStructuredOutput(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Version != "v1" {
+		t.Fatalf("expected default version v1, got %q", out.Version)
+	}
+	if out.FullReportMarkdown == "" {
+		t.Fatalf("expected full_report_markdown default to be filled")
+	}
+	if out.Risks == nil || out.NextSteps == nil || out.Artifacts == nil {
+		t.Fatalf("expected optional collections to be initialized")
+	}
+}
+
+func TestCountJSONCandidates(t *testing.T) {
+	raw := `{"a":1}` + "\n" + `{"b":2}`
+	if got := countJSONCandidates(raw); got != 2 {
+		t.Fatalf("expected 2 candidates, got %d", got)
+	}
+}
+
 func TestSanitizeOutputForSlack(t *testing.T) {
 	in := "[stderr] one\n[stderr]   \n[stderr] two\n\n\nthree"
 	got := sanitizeOutputForSlack(in, 0)
@@ -63,6 +99,7 @@ func TestClassifyStructuredParseFailure(t *testing.T) {
 		{name: "empty output", err: nil, output: "   ", want: "salida_vacia"},
 		{name: "missing fields", err: errString("missing key_findings"), output: "{}", want: "campos_requeridos_faltantes"},
 		{name: "invalid json", err: errString("invalid character"), output: "not json", want: "json_invalido"},
+		{name: "no valid candidate", err: errString("no valid json candidate among 2 objects"), output: "{\"a\":1}", want: "json_final_no_valido"},
 		{name: "schema", err: errString("schema mismatch"), output: "{}", want: "schema_no_cumplido"},
 		{name: "unknown", err: errString("whatever"), output: "x", want: "formato_desconocido"},
 	}

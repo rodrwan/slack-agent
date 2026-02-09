@@ -82,27 +82,37 @@ func parseStructuredOutput(raw string) (structuredOutput, error) {
 	}
 	var out structuredOutput
 	if err := json.Unmarshal([]byte(raw), &out); err == nil {
-		return out, validateStructuredOutput(out)
+		out = normalizeStructuredOutput(out)
+		if vErr := validateStructuredOutput(out); vErr == nil {
+			return out, nil
+		}
 	}
-	jsonBlob := extractJSONObject(raw)
-	if jsonBlob == "" {
+	candidates := extractJSONObjects(raw)
+	if len(candidates) == 0 {
 		return structuredOutput{}, fmt.Errorf("no json object found")
 	}
-	if err := json.Unmarshal([]byte(jsonBlob), &out); err != nil {
-		return structuredOutput{}, err
+	var lastErr error
+	for i := len(candidates) - 1; i >= 0; i-- {
+		if err := json.Unmarshal([]byte(candidates[i]), &out); err != nil {
+			lastErr = err
+			continue
+		}
+		out = normalizeStructuredOutput(out)
+		if err := validateStructuredOutput(out); err != nil {
+			lastErr = err
+			continue
+		}
+		return out, nil
 	}
-	return out, validateStructuredOutput(out)
+	if lastErr != nil {
+		return structuredOutput{}, fmt.Errorf("no valid json candidate among %d objects: %w", len(candidates), lastErr)
+	}
+	return structuredOutput{}, fmt.Errorf("no valid json candidate among %d objects", len(candidates))
 }
 
 func validateStructuredOutput(v structuredOutput) error {
-	if strings.TrimSpace(v.Version) == "" {
-		return fmt.Errorf("missing version")
-	}
 	if strings.TrimSpace(v.TaskSummary) == "" {
 		return fmt.Errorf("missing task_summary")
-	}
-	if strings.TrimSpace(v.FullReportMarkdown) == "" {
-		return fmt.Errorf("missing full_report_markdown")
 	}
 	if len(v.KeyFindings) == 0 {
 		return fmt.Errorf("missing key_findings")
@@ -110,15 +120,49 @@ func validateStructuredOutput(v structuredOutput) error {
 	return nil
 }
 
-func extractJSONObject(s string) string {
-	start := strings.IndexByte(s, '{')
-	if start < 0 {
-		return ""
+func normalizeStructuredOutput(v structuredOutput) structuredOutput {
+	if strings.TrimSpace(v.Version) == "" {
+		v.Version = "v1"
 	}
+	if v.Artifacts == nil {
+		v.Artifacts = make([]struct {
+			Path        string `json:"path"`
+			Description string `json:"description"`
+		}, 0)
+	}
+	if v.Risks == nil {
+		v.Risks = []string{}
+	}
+	if v.NextSteps == nil {
+		v.NextSteps = []string{}
+	}
+	if strings.TrimSpace(v.FullReportMarkdown) == "" {
+		var b strings.Builder
+		b.WriteString("## Resumen\n")
+		b.WriteString(strings.TrimSpace(v.TaskSummary))
+		if len(v.KeyFindings) > 0 {
+			b.WriteString("\n\n## Hallazgos clave")
+			for _, item := range v.KeyFindings {
+				item = strings.TrimSpace(item)
+				if item == "" {
+					continue
+				}
+				b.WriteString("\n- ")
+				b.WriteString(item)
+			}
+		}
+		v.FullReportMarkdown = strings.TrimSpace(b.String())
+	}
+	return v
+}
+
+func extractJSONObjects(s string) []string {
+	objects := make([]string, 0)
 	depth := 0
 	inString := false
 	escaped := false
-	for i := start; i < len(s); i++ {
+	start := -1
+	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		if inString {
 			if escaped {
@@ -139,17 +183,25 @@ func extractJSONObject(s string) string {
 			continue
 		}
 		if ch == '{' {
+			if depth == 0 {
+				start = i
+			}
 			depth++
 			continue
 		}
 		if ch == '}' {
 			depth--
-			if depth == 0 {
-				return s[start : i+1]
+			if depth == 0 && start >= 0 {
+				objects = append(objects, s[start:i+1])
+				start = -1
 			}
 		}
 	}
-	return ""
+	return objects
+}
+
+func countJSONCandidates(s string) int {
+	return len(extractJSONObjects(s))
 }
 
 func sanitizeOutputForSlack(v string, limit int) string {
@@ -242,6 +294,8 @@ func classifyStructuredParseFailure(err error, output string) (code, userMsg str
 	}
 	e := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
+	case strings.Contains(e, "no valid json candidate") || strings.Contains(e, "no json object found"):
+		return "json_final_no_valido", "respuesta final no parseable"
 	case strings.Contains(e, "missing ") || strings.Contains(e, "required"):
 		return "campos_requeridos_faltantes", "faltan campos requeridos"
 	case strings.Contains(e, "unsupported schema") || strings.Contains(e, "schema"):
